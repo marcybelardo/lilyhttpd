@@ -46,23 +46,26 @@ static struct config g_config = {
     .keepalive = 1,
 };
 
-enum conn_state {
-    CONN_READING,
-    CONN_WRITING,
-    CONN_CLOSING
-};
-
 struct connection {
     int fd;
-    enum conn_state state;
+    enum {
+        CONN_READING,
+        CONN_WRITING,
+        CONN_CLOSING
+    } state;
 
     char read_buf[READ_BUF_SIZE];
     size_t read_pos;
 
+    char *method;
+    char *uri;
+
+    char *header;
+    size_t header_len;
+
     char write_buf[WRITE_BUF_SIZE];
     size_t write_pos;
     size_t write_len;
-
 };
 
 void set_nonblocking(int fd)
@@ -78,6 +81,15 @@ void close_conn(struct connection *conn, int epoll_fd)
     free(conn);
 }
 
+void parse_request(struct connection *conn)
+{
+    char *p;
+
+    // method
+    conn->method = strtok(conn->read_buf, " ");
+    conn->uri = strtok(NULL, " ");
+}
+
 void handle_read(struct connection *conn, int epoll_fd)
 {
     assert(conn->state == CONN_READING);
@@ -89,6 +101,9 @@ void handle_read(struct connection *conn, int epoll_fd)
     }
 
     conn->read_pos += n;
+
+    parse_request(conn);
+    printf("METHOD: %s\nURI: %s\n", conn->method, conn->uri);
 
     // assume request ends with \r\n\r\n and always respond the same way
     if (strstr(conn->read_buf, "\r\n\r\n")) {
