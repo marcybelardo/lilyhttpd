@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -121,7 +122,31 @@ void close_connection(struct connection *conn, int epoll_fd)
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
 }
 
-int parse_request(struct connection *conn)
+static char *parse_header_field(const struct connection *conn, const char *field)
+{
+    size_t start, end, val_len;
+    char *pos, *val;
+
+    pos = strcasestr(conn->req, field);
+    if (pos == NULL)
+        return NULL;
+    assert(pos >= conn->req);
+    start = (pos - conn->req) + strlen(field);
+
+    while (end < conn->req_len &&
+        !(conn->req[end] == '\r' && conn->req[end + 1] == '\n'))
+        end++;
+
+    val_len = end - start + 1;
+    val = malloc(val_len);
+    memcpy(val, conn->req + start, val_len);
+    val[val_len] = '\0';
+
+    return val;
+}
+
+// returns position in conn->req where body starts, or -1 on error
+static int parse_request(struct connection *conn)
 {
     char *buf = conn->req;
     size_t len = conn->req_len;
@@ -167,12 +192,33 @@ int parse_request(struct connection *conn)
     i += 2;
 
     // parse headers
-    while (i + 2 < len && !(buf[i] == '\r' && buf[i + 1] == '\n')) {
-        while (i + 1 < len && !(buf[i] == '\r' && buf[i + 1] == '\n')) i++;
-        if (i + 1 >= len) return -1;
-    }
+    for (; i + 4 < len &&
+        buf[i] != '\r' &&
+        buf[i + 1] != '\n' &&
+        buf[i + 2] != '\r' &&
+        buf[i + 3] != '\n';
+        i++)
+    {
+        char *header;
+        size_t header_start = i;
+        while (i < len && buf[i] != ':') i++;
+        buf[i] = '\0';
+        header = &buf[header_start];
 
-    return 0;
+        if (strcasecmp(header, "Host") == 0)
+            conn->host = parse_header_field(conn, "Host: ");
+        if (strcasecmp(header, "Content-Length") == 0)
+            conn->content_length = (size_t)strtoimax(parse_header_field(conn, "Content-Length: "), NULL, 0);
+        if (strcasecmp(header, "User-Agent") == 0)
+            conn->user_agent = parse_header_field(conn, "User-Agent: ");
+        if (strcasecmp(header, "Content-Type") == 0)
+            conn->content_type = parse_header_field(conn, "Content-Type: ");
+        if (strcasecmp(header, "Authorization") == 0)
+            conn->authorization = parse_header_field(conn, "Authorization: ");
+    }
+    i += 4;
+
+    return i;
 }
 
 void recv_req(struct connection *conn, int epoll_fd)
@@ -197,13 +243,15 @@ void recv_req(struct connection *conn, int epoll_fd)
     conn->req_len += (size_t)recvd;
     conn->req[conn->req_len] = '\0';
 
-    if (parse_request(conn) < 0) {
+    ssize_t req_body_pos = parse_request(conn);
+    if (req_body_pos < 0) {
         fprintf(stderr, "recv_req (parse_request_line) invalid request\n");
         exit(EXIT_FAILURE);
     }
 
     printf("METHOD: %s\n", conn->method);
     printf("URL: %s\n", conn->url);
+    conn->req += req_body_pos;
     printf("REQ:\n\n%s\n", conn->req);
 
     // assume request ends with \r\n\r\n and always respond the same way
