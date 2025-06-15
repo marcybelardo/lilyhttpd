@@ -4,6 +4,7 @@
  */
 
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -26,6 +27,8 @@ static const char PKG_NAME[] = "lilyhttpd v0.0.1";
 
 void sigchld_handler(int s)
 {
+    (void)s;
+
     // waitpid() might overwrite errno, so we save and restore it:
     int saved_errno = errno;
     while (waitpid(-1, NULL, WNOHANG) > 0);
@@ -59,6 +62,11 @@ struct connection {
 
     char *method;
     char *url;
+    char *host;
+    size_t content_length;
+    char *user_agent;
+    char *content_type;
+    char *authorization;
 
     char *header;
     size_t header_len;
@@ -76,6 +84,11 @@ static struct connection *new_connection()
     conn->req_len = 0;
     conn->method = NULL;
     conn->url = NULL;
+    conn->host = NULL;
+    conn->content_length = 0;
+    conn->user_agent = NULL;
+    conn->content_type = NULL;
+    conn->authorization = NULL;
     conn->header = NULL;
     conn->header_len = 0;
     conn->resp = NULL;
@@ -93,41 +106,73 @@ void set_nonblocking(int fd)
 
 void close_connection(struct connection *conn, int epoll_fd)
 {
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
     if (conn->fd != -1) close(conn->fd);
-    if (conn->req) free(conn->req);
-    if (conn->method) free(conn->method);
-    if (conn->url) free(conn->url);
-    if (conn->header) free(conn->header);
-    if (conn->resp) free(conn->resp);
-    free(conn);
+    if (conn->req != NULL) free(conn->req);
+    if (conn->method != NULL) free(conn->method);
+    if (conn->url != NULL) free(conn->url);
+    if (conn->host != NULL) free(conn->host);
+    if (conn->user_agent != NULL) free(conn->user_agent);
+    if (conn->content_type != NULL) free(conn->content_type);
+    if (conn->authorization != NULL) free(conn->authorization);
+    if (conn->header != NULL) free(conn->header);
+    if (conn->resp != NULL) free(conn->resp);
+
+    close(conn->fd);
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
 }
 
-void parse_request(struct connection *conn)
+int parse_request(struct connection *conn)
 {
-    char *p;
+    char *buf = conn->req;
+    size_t len = conn->req_len;
 
-    // method
-    for (p = conn->req; *p != ' '; p++);
-    *p++ = '\0';
-    conn->method = conn->req;
-    conn->req = p;
+    // shortest possible HTTP request line is 14 bytes ("GET / HTTP/1.1")
+    if (len < 14) return -1;
 
-    // uri
-    for (; *p != ' '; p++);
-    *p++ = '\0';
-    conn->url = conn->req;
-    conn->req = p;
+    size_t i = 0;
 
-    // get pointer to headers
-    for (; (*p != ' ') &&
-         (*(p + 1) != '\r') &&
-         (*(p + 2) != '\n');
-         p++);
-    p += 3;
-    conn->req = p;
+    // parse method
+    size_t method_start = i;
+    while (i < len && buf[i] != ' ') {
+        // ensure method is in all caps
+        if (!isupper((unsigned char)buf[i])) return -1;
+        i++;
+    }
+    if (i == method_start || i >= len) return -1;
 
-    return;
+    buf[i] = '\0';
+    conn->method = &buf[method_start];
+    i++;
+
+    // parse url
+    size_t url_start = i;
+    while (i < len && buf[i] != ' ') {
+        if (buf[i] == '\r' || buf[i] == '\n') return -1;
+        i++;
+    }
+    if (i == url_start || i >= len) return -1;
+    if (buf[url_start] != '/') return -1;
+
+    buf[i] = '\0';
+    conn->url = &buf[url_start];
+    i++;
+
+    // parse version
+    if (i + 7 >= len) return -1;
+    if (memcmp(&buf[i], "HTTP/1.1", 8) != 0) return -1;
+    i += 8;
+
+    // require CRLF
+    if (i + 1 >= len || buf[i] != '\r' || buf[i + 1] != '\n') return -1;
+    i += 2;
+
+    // parse headers
+    while (i + 2 < len && !(buf[i] == '\r' && buf[i + 1] == '\n')) {
+        while (i + 1 < len && !(buf[i] == '\r' && buf[i + 1] == '\n')) i++;
+        if (i + 1 >= len) return -1;
+    }
+
+    return 0;
 }
 
 void recv_req(struct connection *conn, int epoll_fd)
@@ -147,21 +192,24 @@ void recv_req(struct connection *conn, int epoll_fd)
     }
 
     assert(recvd > 0);
-    conn->req = realloc(conn->req, conn->req_len + recvd + 1);
-    memcpy(conn->req + conn->req_len, buf, recvd);
-    conn->req_len += recvd;
+    conn->req = malloc(conn->req_len + (size_t)recvd + 1);
+    memcpy(conn->req + conn->req_len, buf, (size_t)recvd);
+    conn->req_len += (size_t)recvd;
     conn->req[conn->req_len] = '\0';
 
-    printf("%s\n\n", conn->req);
+    if (parse_request(conn) < 0) {
+        fprintf(stderr, "recv_req (parse_request_line) invalid request\n");
+        exit(EXIT_FAILURE);
+    }
 
-    parse_request(conn);
     printf("METHOD: %s\n", conn->method);
     printf("URL: %s\n", conn->url);
+    printf("REQ:\n\n%s\n", conn->req);
 
     // assume request ends with \r\n\r\n and always respond the same way
     if (strstr(conn->req, "\r\n\r\n")) {
         const char *response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, world!";
-        conn->resp = realloc(conn->resp, conn->resp_len + strlen(response) + 1);
+        conn->resp = malloc(conn->resp_len + strlen(response) + 1);
         memcpy(conn->resp, response, strlen(response));
         conn->resp_len += strlen(response);
         conn->state = CONN_WRITING;
@@ -174,7 +222,7 @@ void recv_req(struct connection *conn, int epoll_fd)
     }
 }
 
-void send_resp(struct connection *conn, int epoll_fd)
+void send_resp(struct connection *conn)
 {
     assert(conn->state == CONN_WRITING);
     ssize_t sent;
@@ -385,7 +433,7 @@ int main(int argc, char *argv[])
                 if (conn->state == CONN_READING && (events[i].events & EPOLLIN)) {
                     recv_req(conn, epoll_fd);
                 } else if (conn->state == CONN_WRITING && (events[i].events & EPOLLOUT)) {
-                    send_resp(conn, epoll_fd);
+                    send_resp(conn);
                 }
 
                 if (conn->state == CONN_CLOSING) {
