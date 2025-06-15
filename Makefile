@@ -1,12 +1,12 @@
 CC?=gcc
 CFLAGS?=-O
 
-all: marigold
+all: lilyhttpd
 
-marigold: marigold.c
-	$(CC) $(CFLAGS) marigold.c -o $@
+marigold: lilyhttpd.c
+	$(CC) $(CFLAGS) lilyhttpd.c -o $@
 
 clean:
-	rm -f marigold
+	rm -f lilyhttpd
 
 .PHONY: all clean

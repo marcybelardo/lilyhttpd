@@ -1,5 +1,5 @@
 /*
- * marigold
+ * lilyhttpd
  * a simple lil' web server
  */
 
@@ -17,7 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static const char PKG_NAME[] = "marigold v0.0.1";
+static const char PKG_NAME[] = "lilyhttpd v0.0.1";
 
 #define MAX_EVENTS 1024
 
@@ -206,7 +206,7 @@ int init_socket()
     hints.ai_flags = AI_PASSIVE;
 
     if ((rv = getaddrinfo(NULL, g_config.port, &hints, &ai)) != 0) {
-        fprintf(stderr, "[ERROR]: init_socket (getaddrinfo): %s\n", gai_strerror(rv));
+        fprintf(stderr, "init_socket (getaddrinfo): %s\n", gai_strerror(rv));
         exit(EXIT_FAILURE);
     }
 
