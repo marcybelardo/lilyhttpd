@@ -54,19 +54,36 @@ struct connection {
         CONN_CLOSING
     } state;
 
-    char read_buf[READ_BUF_SIZE];
-    size_t read_pos;
+    char *req;
+    size_t req_len;
 
     char *method;
-    char *uri;
+    char *url;
 
     char *header;
     size_t header_len;
 
-    char write_buf[WRITE_BUF_SIZE];
-    size_t write_pos;
-    size_t write_len;
+    char *resp;
+    size_t resp_len;
 };
+
+static struct connection *new_connection()
+{
+    struct connection *conn = malloc(sizeof(struct connection));
+
+    conn->fd = -1;
+    conn->req = NULL;
+    conn->req_len = 0;
+    conn->method = NULL;
+    conn->url = NULL;
+    conn->header = NULL;
+    conn->header_len = 0;
+    conn->resp = NULL;
+    conn->resp_len = 0;
+    conn->state = CONN_CLOSING;
+
+    return conn;
+}
 
 void set_nonblocking(int fd)
 {
@@ -74,10 +91,15 @@ void set_nonblocking(int fd)
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-void close_conn(struct connection *conn, int epoll_fd)
+void close_connection(struct connection *conn, int epoll_fd)
 {
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
-    close(conn->fd);
+    if (conn->fd != -1) close(conn->fd);
+    if (conn->req) free(conn->req);
+    if (conn->method) free(conn->method);
+    if (conn->url) free(conn->url);
+    if (conn->header) free(conn->header);
+    if (conn->resp) free(conn->resp);
     free(conn);
 }
 
@@ -86,31 +108,62 @@ void parse_request(struct connection *conn)
     char *p;
 
     // method
-    conn->method = strtok(conn->read_buf, " ");
-    conn->uri = strtok(NULL, " ");
+    for (p = conn->req; *p != ' '; p++);
+    *p++ = '\0';
+    conn->method = conn->req;
+    conn->req = p;
+
+    // uri
+    for (; *p != ' '; p++);
+    *p++ = '\0';
+    conn->url = conn->req;
+    conn->req = p;
+
+    // get pointer to headers
+    for (; (*p != ' ') &&
+         (*(p + 1) != '\r') &&
+         (*(p + 2) != '\n');
+         p++);
+    p += 3;
+    conn->req = p;
+
+    return;
 }
 
-void handle_read(struct connection *conn, int epoll_fd)
+void recv_req(struct connection *conn, int epoll_fd)
 {
     assert(conn->state == CONN_READING);
+    char buf[1024];
+    ssize_t recvd;
 
-    ssize_t n = read(conn->fd, conn->read_buf + conn->read_pos, READ_BUF_SIZE - conn->read_pos);
-    if (n <= 0) {
+    recvd = recv(conn->fd, buf, sizeof(buf), 0);
+    if (recvd < 1) {
+        if (recvd == -1)
+            fprintf(stderr, "recv_req (recv) %d: %s\n",
+                    conn->fd, strerror(errno));
+
         conn->state = CONN_CLOSING;
         return;
     }
 
-    conn->read_pos += n;
+    assert(recvd > 0);
+    conn->req = realloc(conn->req, conn->req_len + recvd + 1);
+    memcpy(conn->req + conn->req_len, buf, recvd);
+    conn->req_len += recvd;
+    conn->req[conn->req_len] = '\0';
+
+    printf("%s\n\n", conn->req);
 
     parse_request(conn);
-    printf("METHOD: %s\nURI: %s\n", conn->method, conn->uri);
+    printf("METHOD: %s\n", conn->method);
+    printf("URL: %s\n", conn->url);
 
     // assume request ends with \r\n\r\n and always respond the same way
-    if (strstr(conn->read_buf, "\r\n\r\n")) {
+    if (strstr(conn->req, "\r\n\r\n")) {
         const char *response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, world!";
-        conn->write_len = strlen(response);
-        memcpy(conn->write_buf, response, conn->write_len);
-        conn->write_pos = 0;
+        conn->resp = realloc(conn->resp, conn->resp_len + strlen(response) + 1);
+        memcpy(conn->resp, response, strlen(response));
+        conn->resp_len += strlen(response);
         conn->state = CONN_WRITING;
 
         // switch to EPOLLOUT
@@ -121,22 +174,22 @@ void handle_read(struct connection *conn, int epoll_fd)
     }
 }
 
-void handle_write(struct connection *conn, int epoll_fd)
+void send_resp(struct connection *conn, int epoll_fd)
 {
     assert(conn->state == CONN_WRITING);
+    ssize_t sent;
 
-    ssize_t n = write(conn->fd, conn->write_buf + conn->write_pos, conn->write_len - conn->write_pos);
-    if (n <= 0) {
+    sent = send(conn->fd, conn->resp, conn->resp_len, 0);
+    if (sent < 1) {
+        if (sent == -1)
+            fprintf(stderr, "send_resp (send) %d: %s\n",
+                    conn->fd, strerror(errno));
+
         conn->state = CONN_CLOSING;
         return;
     }
 
-    conn->write_pos += n;
-    if (conn->write_pos == conn->write_len) {
-        conn->state = CONN_CLOSING;
-
-        // to support keepalive, switch back to reading
-    }
+    conn->state = CONN_CLOSING;
 }
 
 // Thank u beej
@@ -318,10 +371,9 @@ int main(int argc, char *argv[])
             if (events[i].data.fd == server_fd) {
                 // accept new conn
                 int client_fd = accept(server_fd, NULL, NULL);
-                set_nonblocking(client_fd);
-
-                struct connection *conn = calloc(1, sizeof(struct connection));
+                struct connection *conn = new_connection();
                 conn->fd = client_fd;
+                set_nonblocking(conn->fd);
                 conn->state = CONN_READING;
 
                 struct epoll_event client_ev = {0};
@@ -331,13 +383,13 @@ int main(int argc, char *argv[])
             } else {
                 struct connection *conn = events[i].data.ptr;
                 if (conn->state == CONN_READING && (events[i].events & EPOLLIN)) {
-                    handle_read(conn, epoll_fd);
+                    recv_req(conn, epoll_fd);
                 } else if (conn->state == CONN_WRITING && (events[i].events & EPOLLOUT)) {
-                    handle_write(conn, epoll_fd);
+                    send_resp(conn, epoll_fd);
                 }
 
                 if (conn->state == CONN_CLOSING) {
-                    close_conn(conn, epoll_fd);
+                    close_connection(conn, epoll_fd);
                 }
             }
         }
