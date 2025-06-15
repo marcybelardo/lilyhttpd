@@ -1,10 +1,10 @@
-# marigold
+# lilyhttpd
 ## a simple lil' web server
 
 Serve static files at your leisure
 
 ```bash
-$ marigold [path to directory root]
+$ lilyhttpd [path to directory root]
 ```
 
 Options:
