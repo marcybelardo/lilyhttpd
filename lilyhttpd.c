@@ -11,6 +11,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,6 +113,34 @@ void close_connection(struct connection *conn, int epoll_fd)
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
 }
 
+void server_response(struct connection *conn, const int code,
+                     const char * ename, const char *format, ...)
+{
+    char *reason;
+    va_list va;
+
+    va_start(va, format);
+    vasprintf(&reason, format, va);
+    va_end(va);
+
+    conn->resp_len = sprintf(conn->resp,
+        "<!DOCTYPE html><html><head><title>%d %s</title></head><body>\n"
+        "<h1>%s</h1>\n"
+        "<hr>\n"
+        "%s\n"
+        "</body></html>\n",
+        code, ename, ename, reason);
+    free(reason);
+
+    conn->header_len = sprintf(conn->header,
+        "HTTP/1.1 %d %s\r\n"
+        "Server: lilyhttpd\r\n"
+        "Content-Length: %zu\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
+        "\r\n",
+        code, ename, conn->resp_len);
+}
+
 // returns position in conn->req where body starts, or -1 on error
 static int parse_request(struct connection *conn)
 {
@@ -181,15 +210,15 @@ static int parse_request(struct connection *conn)
             else if (strcasecmp(current_value, "close") == 0)
                 g_config.keepalive = 0;
         }
-        if (strcasecmp(current_header, "Host") == 0)
+        else if (strcasecmp(current_header, "Host") == 0)
             conn->host = current_value;
-        if (strcasecmp(current_header, "User-Agent") == 0)
+        else if (strcasecmp(current_header, "User-Agent") == 0)
             conn->user_agent = current_value;
-        if (strcasecmp(current_header, "Content-Type") == 0)
+        else if (strcasecmp(current_header, "Content-Type") == 0)
             conn->content_type = current_value;
-        if (strcasecmp(current_header, "Authorization") == 0)
+        else if (strcasecmp(current_header, "Authorization") == 0)
             conn->authorization = current_value;
-        if (strcasecmp(current_header, "Content-Length") == 0) {
+        else if (strcasecmp(current_header, "Content-Length") == 0) {
             int content_len = strtoimax(current_value, NULL, 0);
             conn->content_length = (size_t)content_len;
         }
@@ -234,29 +263,40 @@ void recv_req(struct connection *conn, int epoll_fd)
         exit(EXIT_FAILURE);
     }
 
-    if ((size_t)bytes_parsed >= conn->req_len) {
-        const char *response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, world!";
-        conn->resp = malloc(conn->resp_len + strlen(response) + 1);
-        memcpy(conn->resp, response, strlen(response));
-        conn->resp_len += strlen(response);
-        conn->state = CONN_WRITING;
+    if (strcmp(conn->method, "GET") == 0)
+        assert(conn->req_len == (size_t)bytes_parsed);
 
-        // switch to EPOLLOUT
-        struct epoll_event ev = {0};
-        ev.events = EPOLLOUT;
-        ev.data.ptr = conn;
-        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
-    }
+    if (strcmp(conn->url, "/") == 0)
+        server_response(conn, 200, "OK", "Hello, world!");
+    else
+        server_response(conn, 404, "Not Found", "Path %s cannot be found", conn->url);
+
+    conn->state = CONN_WRITING;
+
+    // switch to EPOLLOUT
+    struct epoll_event ev = {0};
+    ev.events = EPOLLOUT;
+    ev.data.ptr = conn;
+    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
 }
 
 void send_resp(struct connection *conn)
 {
     assert(conn->state == CONN_WRITING);
-    ssize_t sent;
+    ssize_t header_sent, resp_sent;
 
-    sent = send(conn->fd, conn->resp, conn->resp_len, 0);
-    if (sent < 1) {
-        if (sent == -1)
+    header_sent = send(conn->fd, conn->header, conn->header_len, 0);
+    if (header_sent < 1) {
+        if (header_sent == -1)
+            fprintf(stderr, "send_resp (send) %d: %s\n",
+                    conn->fd, strerror(errno));
+
+        conn->state = CONN_CLOSING;
+        return;
+    }
+    resp_sent = send(conn->fd, conn->resp, conn->resp_len, 0);
+    if (resp_sent < 1) {
+        if (resp_sent == -1)
             fprintf(stderr, "send_resp (send) %d: %s\n",
                     conn->fd, strerror(errno));
 
