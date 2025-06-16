@@ -109,7 +109,6 @@ void close_connection(struct connection *conn, int epoll_fd)
     if (conn->header != NULL) free(conn->header);
     if (conn->resp != NULL) free(conn->resp);
 
-    close(conn->fd);
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
 }
 
