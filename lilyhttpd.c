@@ -23,9 +23,6 @@ static const char PKG_NAME[] = "lilyhttpd v0.0.1";
 
 #define MAX_EVENTS 1024
 
-#define READ_BUF_SIZE 4096
-#define WRITE_BUF_SIZE 4096
-
 void sigchld_handler(int s)
 {
     (void)s;
@@ -109,40 +106,11 @@ void close_connection(struct connection *conn, int epoll_fd)
 {
     if (conn->fd != -1) close(conn->fd);
     if (conn->req != NULL) free(conn->req);
-    if (conn->method != NULL) free(conn->method);
-    if (conn->url != NULL) free(conn->url);
-    if (conn->host != NULL) free(conn->host);
-    if (conn->user_agent != NULL) free(conn->user_agent);
-    if (conn->content_type != NULL) free(conn->content_type);
-    if (conn->authorization != NULL) free(conn->authorization);
     if (conn->header != NULL) free(conn->header);
     if (conn->resp != NULL) free(conn->resp);
 
     close(conn->fd);
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
-}
-
-static char *parse_header_field(const struct connection *conn, const char *field)
-{
-    size_t start, end, val_len;
-    char *pos, *val;
-
-    pos = strcasestr(conn->req, field);
-    if (pos == NULL)
-        return NULL;
-    assert(pos >= conn->req);
-    start = (pos - conn->req) + strlen(field);
-
-    while (end < conn->req_len &&
-        !(conn->req[end] == '\r' && conn->req[end + 1] == '\n'))
-        end++;
-
-    val_len = end - start + 1;
-    val = malloc(val_len);
-    memcpy(val, conn->req + start, val_len);
-    val[val_len] = '\0';
-
-    return val;
 }
 
 // returns position in conn->req where body starts, or -1 on error
@@ -191,33 +159,51 @@ static int parse_request(struct connection *conn)
     if (i + 1 >= len || buf[i] != '\r' || buf[i + 1] != '\n') return -1;
     i += 2;
 
-    // parse headers
-    for (; i + 4 < len &&
+    do {
+        char *current_header;
+        size_t header_start = i;
+        for (; i < len && buf[i] != ':'; i++);
+        buf[i] = '\0';
+        current_header = &buf[header_start];
+        i += 2;
+
+        char *current_value;
+        size_t value_start = i;
+        for (; i + 2 < len && buf[i] != '\r' && buf[i + 1] != '\n'; i++);
+        buf[i] = '\0';
+        current_value = &buf[value_start];
+        i += 2;
+
+        printf("%s: %s\n", current_header, current_value);
+
+        if (strcasecmp(current_header, "Connection") == 0) {
+            if (strcasecmp(current_value, "keep-alive") == 0)
+                g_config.keepalive = 1;
+            else if (strcasecmp(current_value, "close") == 0)
+                g_config.keepalive = 0;
+        }
+        if (strcasecmp(current_header, "Host") == 0)
+            conn->host = current_value;
+        if (strcasecmp(current_header, "User-Agent") == 0)
+            conn->user_agent = current_value;
+        if (strcasecmp(current_header, "Content-Type") == 0)
+            conn->content_type = current_value;
+        if (strcasecmp(current_header, "Authorization") == 0)
+            conn->authorization = current_value;
+        if (strcasecmp(current_header, "Content-Length") == 0) {
+            int content_len = strtoimax(current_value, NULL, 0);
+            conn->content_length = (size_t)content_len;
+        }
+    } while (i + 4 <= len &&
         buf[i] != '\r' &&
         buf[i + 1] != '\n' &&
         buf[i + 2] != '\r' &&
-        buf[i + 3] != '\n';
-        i++)
-    {
-        char *header;
-        size_t header_start = i;
-        while (i < len && buf[i] != ':') i++;
-        buf[i] = '\0';
-        header = &buf[header_start];
+        buf[i + 3] != '\n');
 
-        if (strcasecmp(header, "Host") == 0)
-            conn->host = parse_header_field(conn, "Host: ");
-        if (strcasecmp(header, "Content-Length") == 0)
-            conn->content_length = (size_t)strtoimax(parse_header_field(conn, "Content-Length: "), NULL, 0);
-        if (strcasecmp(header, "User-Agent") == 0)
-            conn->user_agent = parse_header_field(conn, "User-Agent: ");
-        if (strcasecmp(header, "Content-Type") == 0)
-            conn->content_type = parse_header_field(conn, "Content-Type: ");
-        if (strcasecmp(header, "Authorization") == 0)
-            conn->authorization = parse_header_field(conn, "Authorization: ");
-    }
-    i += 4;
-
+    // we count two more bytes because the header parsing jumps two bytes
+    // after successfully parsing every header, so this jump puts us
+    // right at the start of the request body
+    i += 2;
     return i;
 }
 
@@ -243,19 +229,13 @@ void recv_req(struct connection *conn, int epoll_fd)
     conn->req_len += (size_t)recvd;
     conn->req[conn->req_len] = '\0';
 
-    ssize_t req_body_pos = parse_request(conn);
-    if (req_body_pos < 0) {
+    ssize_t bytes_parsed = parse_request(conn);
+    if (bytes_parsed < 0) {
         fprintf(stderr, "recv_req (parse_request_line) invalid request\n");
         exit(EXIT_FAILURE);
     }
 
-    printf("METHOD: %s\n", conn->method);
-    printf("URL: %s\n", conn->url);
-    conn->req += req_body_pos;
-    printf("REQ:\n\n%s\n", conn->req);
-
-    // assume request ends with \r\n\r\n and always respond the same way
-    if (strstr(conn->req, "\r\n\r\n")) {
+    if ((size_t)bytes_parsed >= conn->req_len) {
         const char *response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, world!";
         conn->resp = malloc(conn->resp_len + strlen(response) + 1);
         memcpy(conn->resp, response, strlen(response));
