@@ -24,7 +24,7 @@ static const char PKG_NAME[] = "lilyhttpd v0.0.1";
 
 #define MAX_EVENTS 1024
 
-void sigchld_handler(int s)
+static void sigchld_handler(int s)
 {
     (void)s;
 
@@ -88,13 +88,13 @@ static struct connection *new_connection()
     return conn;
 }
 
-void set_nonblocking(int fd)
+static void set_nonblocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-void close_connection(struct connection *conn, int epoll_fd)
+static void close_connection(struct connection *conn, int epoll_fd)
 {
     if (conn->fd != -1) close(conn->fd);
     if (conn->req != NULL) free(conn->req);
@@ -104,7 +104,7 @@ void close_connection(struct connection *conn, int epoll_fd)
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
 }
 
-void server_response(struct connection *conn, const int code,
+static void server_response(struct connection *conn, const int code,
                      const char *ename, const char *format, ...)
 {
     char *reason;
@@ -225,7 +225,7 @@ static int parse_request(struct connection *conn)
     return i;
 }
 
-void recv_req(struct connection *conn, int epoll_fd)
+static void recv_req(struct connection *conn, int epoll_fd)
 {
     assert(conn->state == CONN_READING);
     char buf[1024];
@@ -272,7 +272,7 @@ void recv_req(struct connection *conn, int epoll_fd)
     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
 }
 
-void send_resp(struct connection *conn)
+static void send_resp(struct connection *conn)
 {
     assert(conn->state == CONN_WRITING);
     ssize_t header_sent, resp_sent;
@@ -300,7 +300,7 @@ void send_resp(struct connection *conn)
 }
 
 // Thank u beej
-int init_socket()
+static int init_socket()
 {
     int fd;
     struct addrinfo hints, *ai, *p;
@@ -381,7 +381,7 @@ static void daemon_start()
     }
 }
 
-void daemon_finish()
+static void daemon_finish()
 {
     if (fd_null == -1)
         return;
@@ -411,7 +411,7 @@ static void print_usage(const char *pname)
            "\t\tDisable keepalive functionality.\n\n");
 }
 
-void parse_args(const int argc, char *argv[])
+static void parse_args(const int argc, char *argv[])
 {
     int i;
     size_t len;
