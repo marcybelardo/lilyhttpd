@@ -174,6 +174,7 @@ static void process_get(struct connection *conn)
     }
 
     conn->resp_fd = open(target, O_RDONLY | O_NONBLOCK);
+    free(target);
 
     if (conn->resp_fd == -1) {
         switch (errno) {
