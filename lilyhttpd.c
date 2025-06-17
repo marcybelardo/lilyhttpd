@@ -34,19 +34,10 @@ void sigchld_handler(int s)
     errno = saved_errno;
 }
 
-struct config {
-    char *root_dir;
-    char *port;
-    int daemonize;
-    int keepalive;
-};
-
-static struct config g_config = {
-    .root_dir = NULL,
-    .port = "8080",
-    .daemonize = 0,
-    .keepalive = 1,
-};
+static char *root_dir = NULL;
+static char *port = "8080";
+static int daemonize = 0;
+static int keepalive = 1;
 
 struct connection {
     int fd;
@@ -114,7 +105,7 @@ void close_connection(struct connection *conn, int epoll_fd)
 }
 
 void server_response(struct connection *conn, const int code,
-                     const char * ename, const char *format, ...)
+                     const char *ename, const char *format, ...)
 {
     char *reason;
     va_list va;
@@ -123,16 +114,16 @@ void server_response(struct connection *conn, const int code,
     vasprintf(&reason, format, va);
     va_end(va);
 
-    conn->resp_len = sprintf(conn->resp,
+    conn->resp_len = asprintf(&(conn->resp),
         "<!DOCTYPE html><html><head><title>%d %s</title></head><body>\n"
-        "<h1>%s</h1>\n"
+        "<h1>%d %s</h1>\n"
         "<hr>\n"
         "%s\n"
         "</body></html>\n",
-        code, ename, ename, reason);
+        code, ename, code, ename, reason);
     free(reason);
 
-    conn->header_len = sprintf(conn->header,
+    conn->header_len = asprintf(&(conn->header),
         "HTTP/1.1 %d %s\r\n"
         "Server: lilyhttpd\r\n"
         "Content-Length: %zu\r\n"
@@ -206,9 +197,9 @@ static int parse_request(struct connection *conn)
 
         if (strcasecmp(current_header, "Connection") == 0) {
             if (strcasecmp(current_value, "keep-alive") == 0)
-                g_config.keepalive = 1;
+                keepalive = 1;
             else if (strcasecmp(current_value, "close") == 0)
-                g_config.keepalive = 0;
+                keepalive = 0;
         }
         else if (strcasecmp(current_header, "Host") == 0)
             conn->host = current_value;
@@ -219,8 +210,7 @@ static int parse_request(struct connection *conn)
         else if (strcasecmp(current_header, "Authorization") == 0)
             conn->authorization = current_value;
         else if (strcasecmp(current_header, "Content-Length") == 0) {
-            int content_len = strtoimax(current_value, NULL, 0);
-            conn->content_length = (size_t)content_len;
+            conn->content_length = atol(current_value);
         }
     } while (i + 4 <= len &&
         buf[i] != '\r' &&
@@ -265,11 +255,13 @@ void recv_req(struct connection *conn, int epoll_fd)
 
     if (strcmp(conn->method, "GET") == 0)
         assert(conn->req_len == (size_t)bytes_parsed);
+    else
+        server_response(conn, 501, "Not Implemented", "The method '%s' is not implemented", conn->method);
 
     if (strcmp(conn->url, "/") == 0)
         server_response(conn, 200, "OK", "Hello, world!");
     else
-        server_response(conn, 404, "Not Found", "Path %s cannot be found", conn->url);
+        server_response(conn, 404, "Not Found", "Path '%s' cannot be found", conn->url);
 
     conn->state = CONN_WRITING;
 
@@ -320,7 +312,7 @@ int init_socket()
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    if ((rv = getaddrinfo(NULL, g_config.port, &hints, &ai)) != 0) {
+    if ((rv = getaddrinfo(NULL, port, &hints, &ai)) != 0) {
         fprintf(stderr, "init_socket (getaddrinfo): %s\n", gai_strerror(rv));
         exit(EXIT_FAILURE);
     }
@@ -354,7 +346,7 @@ int init_socket()
         exit(EXIT_FAILURE);
     }
 
-    printf("Listening on port %s...\n", g_config.port);
+    printf("Listening on port %s...\n", port);
 
     return fd;
 }
@@ -411,7 +403,7 @@ void daemon_finish()
 static void print_usage(const char *pname)
 {
     printf("USAGE:\t%s /path/to/root [Options...]\n\n", pname);
-    printf("Options:\n\t--port <NUMBER> (default: %s)\n", g_config.port);
+    printf("Options:\n\t--port <NUMBER> (default: %s)\n", port);
     printf("\t\tPort to listen on for connections.\n");
     printf("\t--daemon (default: false)\n"
            "\t\tDetach process from terminal and run in background.\n");
@@ -429,23 +421,23 @@ void parse_args(const int argc, char *argv[])
         exit(EXIT_SUCCESS);
     }
 
-    g_config.root_dir = strdup(argv[1]);
-    len = strlen(g_config.root_dir);
+    root_dir = strdup(argv[1]);
+    len = strlen(root_dir);
     if (len == 0)
         fprintf(stderr, "Root directory cannot be empty\n");
     if (len > 1)
-        if (g_config.root_dir[len - 1] == '/')
-            g_config.root_dir[len - 1] = '\0';
+        if (root_dir[len - 1] == '/')
+            root_dir[len - 1] = '\0';
 
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0) {
             if (++i >= argc)
                 fprintf(stderr, "Please provide a port number\n");
-            g_config.port = argv[i];
+            port = argv[i];
         } else if (strcmp(argv[i], "--daemon") == 0) {
-            g_config.daemonize = 1;
+            daemonize = 1;
         } else if (strcmp(argv[i], "--no-keepalive") == 0) {
-            g_config.keepalive = 0;
+            keepalive = 0;
         }
     }
 }
@@ -458,7 +450,7 @@ int main(int argc, char *argv[])
     int server_fd = init_socket();
     set_nonblocking(server_fd);
 
-    if (g_config.daemonize)
+    if (daemonize)
         daemon_start();
 
     sa.sa_handler = sigchld_handler;
@@ -469,7 +461,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (g_config.daemonize)
+    if (daemonize)
         daemon_finish();
 
     int epoll_fd = epoll_create1(0);
