@@ -3,6 +3,7 @@
  * a simple lil' web server
  */
 
+#include <asm-generic/errno-base.h>
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -16,7 +17,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -34,6 +37,8 @@ static void sigchld_handler(int s)
     errno = saved_errno;
 }
 
+static const char *index_name = "index.html";
+static const char *server_header = "Server: lilyhttpd";
 static char *root_dir = NULL;
 static char *port = "8080";
 static int daemonize = 0;
@@ -60,7 +65,13 @@ struct connection {
 
     char *header;
     size_t header_len;
+    int header_only;
 
+    enum {
+        SERV_RESP,
+        FILE_RESP
+    } resp_type;
+    int resp_fd;
     char *resp;
     size_t resp_len;
 };
@@ -81,6 +92,9 @@ static struct connection *new_connection()
     conn->authorization = NULL;
     conn->header = NULL;
     conn->header_len = 0;
+    conn->header_only = 0;
+    conn->resp_type = SERV_RESP;
+    conn->resp_fd = -1;
     conn->resp = NULL;
     conn->resp_len = 0;
     conn->state = CONN_CLOSING;
@@ -94,11 +108,17 @@ static void set_nonblocking(int fd)
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+/*
+ * A lot of info fields (e.g. host, user_agent) are char pointers
+ * pulled from conn->req so we just have to ensure that all that
+ * data exists and is freed along with conn->req
+ */
 static void close_connection(struct connection *conn, int epoll_fd)
 {
     if (conn->fd != -1) close(conn->fd);
     if (conn->req != NULL) free(conn->req);
     if (conn->header != NULL) free(conn->header);
+    if (conn->resp_fd != -1) close(conn->resp_fd);
     if (conn->resp != NULL) free(conn->resp);
 
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
@@ -125,14 +145,69 @@ static void server_response(struct connection *conn, const int code,
 
     conn->header_len = asprintf(&(conn->header),
         "HTTP/1.1 %d %s\r\n"
-        "Server: lilyhttpd\r\n"
+        "%s\r\n"
         "Content-Length: %zu\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "\r\n",
-        code, ename, conn->resp_len);
+        code, ename, server_header, conn->resp_len);
+
+    conn->resp_type = SERV_RESP;
 }
 
-// returns position in conn->req where body starts, or -1 on error
+static void process_get(struct connection *conn)
+{
+    char *target, *end;
+    struct stat filestat;
+
+    if ((end = strchr(conn->url, '?')) != NULL)
+        *end = '\0';
+
+    if (conn->url[strlen(conn->url) - 1] == '/') {
+        // if path ends with '/', get the index file
+        (void)asprintf(&target, "%s%s%s", root_dir, conn->url, index_name);
+        if ((stat(target, &filestat) == -1) && (errno == ENOENT)) {
+            free(target);
+            server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
+        }
+    } else {
+        (void)asprintf(&target, "%s%s", root_dir, conn->url);
+    }
+
+    conn->resp_fd = open(target, O_RDONLY | O_NONBLOCK);
+
+    if (conn->resp_fd == -1) {
+        switch (errno) {
+            case EACCES:
+                server_response(conn, 403, "Forbidden", "You do not have permission to access this URL");
+                break;
+            case ENOENT:
+                server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
+                break;
+            default:
+                server_response(conn, 500, "Internal Server Error",
+                                "The URL you requested cannot be opened: %s", strerror(errno));
+        }
+    }
+
+    conn->resp_len = filestat.st_size;
+    conn->header_len = asprintf(&(conn->header),
+            "HTTP/1.1 200 OK\r\n"
+            "%s\r\n" // server
+            "Connection: %s\r\n" // keepalive
+            "Content-Length: %zu\r\n"
+            "Content-Type: %s\r\n"
+            "\r\n",
+            server_header,
+            keepalive ? "keep-alive" : "close",
+            conn->resp_len,
+            "text/html; charset=UTF-8");
+    conn->resp_type = FILE_RESP;
+}
+
+/*
+ * Returns the number of bytes parsed in the request up to the request body
+ * or -1 on error
+ */
 static int parse_request(struct connection *conn)
 {
     char *buf = conn->req;
@@ -193,8 +268,6 @@ static int parse_request(struct connection *conn)
         current_value = &buf[value_start];
         i += 2;
 
-        printf("%s: %s\n", current_header, current_value);
-
         if (strcasecmp(current_header, "Connection") == 0) {
             if (strcasecmp(current_value, "keep-alive") == 0)
                 keepalive = 1;
@@ -249,19 +322,16 @@ static void recv_req(struct connection *conn, int epoll_fd)
 
     ssize_t bytes_parsed = parse_request(conn);
     if (bytes_parsed < 0) {
-        fprintf(stderr, "recv_req (parse_request_line) invalid request\n");
-        exit(EXIT_FAILURE);
+        fprintf(stderr, "recv_req (parse_request_line) can't parse request\n");
+        server_response(conn, 400, "Bad Request", "Can't parse request");
     }
 
     if (strcmp(conn->method, "GET") == 0)
-        assert(conn->req_len == (size_t)bytes_parsed);
-    else
-        server_response(conn, 501, "Not Implemented", "The method '%s' is not implemented", conn->method);
-
-    if (strcmp(conn->url, "/") == 0)
-        server_response(conn, 200, "OK", "Hello, world!");
-    else
-        server_response(conn, 404, "Not Found", "Path '%s' cannot be found", conn->url);
+        process_get(conn);
+    else if (strcmp(conn->method, "HEAD") == 0) {
+        conn->header_only = 1;
+        process_get(conn);
+    }
 
     conn->state = CONN_WRITING;
 
@@ -275,21 +345,35 @@ static void recv_req(struct connection *conn, int epoll_fd)
 static void send_resp(struct connection *conn)
 {
     assert(conn->state == CONN_WRITING);
-    ssize_t header_sent, resp_sent;
+    ssize_t header_sent, resp_sent = 0;
 
+    assert(conn->header_len == strlen(conn->header));
     header_sent = send(conn->fd, conn->header, conn->header_len, 0);
     if (header_sent < 1) {
         if (header_sent == -1)
-            fprintf(stderr, "send_resp (send) %d: %s\n",
+            fprintf(stderr, "send_resp (send headers) %d: %s\n",
                     conn->fd, strerror(errno));
 
         conn->state = CONN_CLOSING;
         return;
     }
-    resp_sent = send(conn->fd, conn->resp, conn->resp_len, 0);
+    if (conn->header_only) {
+        conn->state = CONN_CLOSING;
+        return;
+    }
+
+    switch (conn->resp_type) {
+        case SERV_RESP:
+            assert(conn->resp_len == strlen(conn->resp));
+            resp_sent = send(conn->fd, conn->resp, conn->resp_len, 0);
+            break;
+        case FILE_RESP:
+            resp_sent = sendfile(conn->fd, conn->resp_fd, NULL, conn->resp_len);
+            break;
+    }
     if (resp_sent < 1) {
         if (resp_sent == -1)
-            fprintf(stderr, "send_resp (send) %d: %s\n",
+            fprintf(stderr, "send_resp (send resp) %d: %s\n",
                     conn->fd, strerror(errno));
 
         conn->state = CONN_CLOSING;
@@ -299,7 +383,10 @@ static void send_resp(struct connection *conn)
     conn->state = CONN_CLOSING;
 }
 
-// Thank u beej
+/*
+ * Returns the file descriptor to the server listener
+ * thank u beej
+ */
 static int init_socket()
 {
     int fd;
