@@ -323,7 +323,6 @@ static void recv_req(struct connection *conn, int epoll_fd)
 
     ssize_t bytes_parsed = parse_request(conn);
     if (bytes_parsed < 0) {
-        fprintf(stderr, "recv_req (parse_request_line) can't parse request\n");
         server_response(conn, 400, "Bad Request", "Can't parse request");
     }
 
@@ -332,6 +331,9 @@ static void recv_req(struct connection *conn, int epoll_fd)
     else if (strcmp(conn->method, "HEAD") == 0) {
         conn->header_only = 1;
         process_get(conn);
+    } else {
+        server_response(conn, 501, "Not Implemented",
+                        "Server does not implement method '%s'", conn->method);
     }
 
     conn->state = CONN_WRITING;
