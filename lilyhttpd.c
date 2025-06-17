@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char PKG_NAME[] = "lilyhttpd v0.0.1";
@@ -42,7 +43,8 @@ static const char *server_header = "Server: lilyhttpd";
 static char *root_dir = NULL;
 static char *port = "8080";
 static int daemonize = 0;
-static int keepalive = 1;
+static int force_keepalive = 0;
+static time_t now;
 
 struct connection {
     int fd;
@@ -54,7 +56,6 @@ struct connection {
 
     char *req;
     size_t req_len;
-
     char *method;
     char *url;
     char *host;
@@ -62,6 +63,7 @@ struct connection {
     char *user_agent;
     char *content_type;
     char *authorization;
+    int keepalive;
 
     char *header;
     size_t header_len;
@@ -90,6 +92,7 @@ static struct connection *new_connection()
     conn->user_agent = NULL;
     conn->content_type = NULL;
     conn->authorization = NULL;
+    conn->keepalive = 0;
     conn->header = NULL;
     conn->header_len = 0;
     conn->header_only = 0;
@@ -124,15 +127,27 @@ static void close_connection(struct connection *conn, int epoll_fd)
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
 }
 
+#define DATE_LEN 30
+static char *rfc1123_date(char *dest, const time_t when)
+{
+    time_t when_copy = when;
+    if (strftime(dest, DATE_LEN, "%a, %d %b %Y %H:%M:%S GMT", gmtime(&when_copy)) == 0)
+        dest[0] = '\0';
+
+    return dest;
+}
+
 static void server_response(struct connection *conn, const int code,
                      const char *ename, const char *format, ...)
 {
-    char *reason;
+    char *reason, date[DATE_LEN];
     va_list va;
 
     va_start(va, format);
     vasprintf(&reason, format, va);
     va_end(va);
+
+    rfc1123_date(date, now);
 
     conn->resp_len = asprintf(&(conn->resp),
         "<!DOCTYPE html><html><head><title>%d %s</title></head><body>\n"
@@ -145,11 +160,19 @@ static void server_response(struct connection *conn, const int code,
 
     conn->header_len = asprintf(&(conn->header),
         "HTTP/1.1 %d %s\r\n"
+        "Date: %s\r\n"
         "%s\r\n"
+        "Connection: %s\r\n"
         "Content-Length: %zu\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "\r\n",
-        code, ename, server_header, conn->resp_len);
+        code,
+        ename,
+        date,
+        server_header,
+        conn->keepalive ? "keep-alive" : "close",
+        conn->resp_len
+    );
 
     conn->resp_type = SERV_RESP;
 }
@@ -157,6 +180,7 @@ static void server_response(struct connection *conn, const int code,
 static void process_get(struct connection *conn)
 {
     char *target, *end;
+    char date[DATE_LEN];
     struct stat filestat;
 
     if ((end = strchr(conn->url, '?')) != NULL)
@@ -193,13 +217,15 @@ static void process_get(struct connection *conn)
     conn->resp_len = filestat.st_size;
     conn->header_len = asprintf(&(conn->header),
             "HTTP/1.1 200 OK\r\n"
+            "Date: %s\r\n"
             "%s\r\n" // server
             "Connection: %s\r\n" // keepalive
             "Content-Length: %zu\r\n"
             "Content-Type: %s\r\n"
             "\r\n",
+            rfc1123_date(date, now),
             server_header,
-            keepalive ? "keep-alive" : "close",
+            conn->keepalive ? "keep-alive" : "close",
             conn->resp_len,
             "text/html; charset=UTF-8");
     conn->resp_type = FILE_RESP;
@@ -271,9 +297,11 @@ static int parse_request(struct connection *conn)
 
         if (strcasecmp(current_header, "Connection") == 0) {
             if (strcasecmp(current_value, "keep-alive") == 0)
-                keepalive = 1;
+                conn->keepalive = 1;
             else if (strcasecmp(current_value, "close") == 0)
-                keepalive = 0;
+                conn->keepalive = 0;
+
+            if (force_keepalive) conn->keepalive = 1;
         }
         else if (strcasecmp(current_header, "Host") == 0)
             conn->host = current_value;
@@ -495,10 +523,10 @@ static void print_usage(const char *pname)
     printf("USAGE:\t%s /path/to/root [Options...]\n\n", pname);
     printf("Options:\n\t--port <NUMBER> (default: %s)\n", port);
     printf("\t\tPort to listen on for connections.\n");
-    printf("\t--daemon (default: false)\n"
+    printf("\t--daemon\n"
            "\t\tDetach process from terminal and run in background.\n");
-    printf("\t--no-keepalive\n"
-           "\t\tDisable keepalive functionality.\n\n");
+    printf("\t--[no-]keepalive\n"
+           "\t\tEnable or disable keepalive functionality.\n\n");
 }
 
 static void parse_args(const int argc, char *argv[])
@@ -527,7 +555,9 @@ static void parse_args(const int argc, char *argv[])
         } else if (strcmp(argv[i], "--daemon") == 0) {
             daemonize = 1;
         } else if (strcmp(argv[i], "--no-keepalive") == 0) {
-            keepalive = 0;
+            force_keepalive = 0;
+        } else if (strcmp(argv[i], "--keepalive") == 0) {
+            force_keepalive = 1;
         }
     }
 }
@@ -578,6 +608,7 @@ int main(int argc, char *argv[])
                 client_ev.data.ptr = conn;
                 epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev);
             } else {
+                now = time(NULL);
                 struct connection *conn = events[i].data.ptr;
                 if (conn->state == CONN_READING && (events[i].events & EPOLLIN)) {
                     recv_req(conn, epoll_fd);
