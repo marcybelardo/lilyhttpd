@@ -3,7 +3,7 @@
  * a simple lil' web server
  */
 
-#include <asm-generic/errno-base.h>
+#include <arpa/inet.h>
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -13,9 +13,12 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syslog.h>
+#include <syslog.h>
 #include <sys/epoll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
@@ -24,7 +27,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static const char PKG_NAME[] = "lilyhttpd v0.0.1";
+static const char PKG_NAME[] = "lilyhttpd v0.1.0";
 
 #define MAX_EVENTS 1024
 
@@ -38,6 +41,20 @@ static void sigchld_handler(int s)
     errno = saved_errno;
 }
 
+typedef enum {
+    LDEBUG = 0,
+    LINFO,
+    LWARN,
+    LERROR
+} LogLevel;
+
+static const char *log_level_names[] = {
+    "DEBUG",
+    "INFO",
+    "WARN",
+    "ERROR"
+};
+
 static const char *index_name = "index.html";
 static const char *server_header = "Server: lilyhttpd";
 static char *root_dir = NULL;
@@ -45,12 +62,17 @@ static char *port = "8080";
 static int daemonize = 0;
 static int force_keepalive = 0;
 static time_t now;
+static LogLevel current_log_level = LDEBUG;
+static int debug_mode = 0;
+static FILE *log_file = NULL;
+static int use_syslog = 0;
 
 struct connection {
     int fd;
     enum {
         CONN_READING,
         CONN_WRITING,
+        CONN_KEEPALIVE,
         CONN_CLOSING
     } state;
 
@@ -77,6 +99,113 @@ struct connection {
     char *resp;
     size_t resp_len;
 };
+
+struct mime_type {
+    char *ext;
+    char *type;
+};
+
+#define MIME_COUNT 27
+static const struct mime_type mime_map[27] = {
+    {"bin", "application/octet-stream"},
+    {"bmp", "image/bmp"},
+    {"css", "text/css"},
+    {"gif", "image/gif"},
+    {"htm", "text/html"},
+    {"html", "text/html"},
+    {"ico", "image/vnd.microsoft.icon"},
+    {"jpeg", "image/jpeg"},
+    {"jpg", "image/jpeg"},
+    {"js", "text/javascript"},
+    {"json", "application/json"},
+    {"md", "text/markdown"},
+    {"mjs", "text/javascript"},
+    {"mp3", "audio/mpeg"},
+    {"mp4", "video/mp4"},
+    {"mpeg", "video/mpeg"},
+    {"png", "image/png"},
+    {"pdf", "application/pdf"},
+    {"svg", "image/svg+xml"},
+    {"ttf", "font/ttf"},
+    {"txt", "text/plain"},
+    {"wav", "audio/wav"},
+    {"webm", "video/webm"},
+    {"webp", "image/webp"},
+    {"woff", "font/woff"},
+    {"woff2", "font/woff2"},
+    {"xml", "application/xml"},
+};
+
+void init_log(int enable_debug, const char *log_path, int enable_syslog, LogLevel level)
+{
+    debug_mode = enable_debug;
+    current_log_level = level;
+    use_syslog = enable_syslog;
+
+    if (use_syslog)
+        openlog("lilyhttpd", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+
+    if (log_path && !use_syslog) {
+        log_file = fopen(log_path, "a");
+        if (!log_file) {
+            fprintf(stderr, "Could not open log file %s\n", log_path);
+            log_file = stderr;
+        }
+    } else if (!debug_mode && !use_syslog) {
+        log_file = stderr;
+    }
+}
+
+void log_msg(LogLevel level, const char *fmt, ...)
+{
+    if (level < current_log_level)
+        return;
+
+    va_list args;
+    va_start(args, fmt);
+
+    char timebuf[64] = {0};
+    struct tm *tm_info = localtime(&now);
+    strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    if (debug_mode || log_file) {
+        FILE *out = debug_mode ? stderr : log_file;
+        fprintf(out, "[%s] %s: ", timebuf, log_level_names[level]);
+        vfprintf(out, fmt, args);
+        fprintf(out, "\n");
+        fflush(out);
+    }
+
+    if (use_syslog) {
+        int syslog_level = LINFO;
+        switch (level) {
+            case LDEBUG: syslog_level = LOG_DEBUG; break;
+            case LINFO: syslog_level = LOG_INFO; break;
+            case LWARN: syslog_level = LOG_WARNING; break;
+            case LERROR: syslog_level = LOG_ERR; break;
+        }
+
+        vsyslog(syslog_level, fmt, args);
+    }
+
+    va_end(args);
+}
+
+void close_log()
+{
+    if (log_file && log_file != stderr)
+        fclose(log_file);
+    if (use_syslog)
+        closelog();
+}
+
+void *get_in_addr(struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET)
+        return &(((struct sockaddr_in *)sa)->sin_addr);
+
+    return &(((struct sockaddr_in6 *)sa)->sin6_addr);
+}
 
 static struct connection *new_connection()
 {
@@ -127,6 +256,35 @@ static void close_connection(struct connection *conn, int epoll_fd)
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
 }
 
+static void keepalive_connection(struct connection *conn, int epoll_fd)
+{
+    assert(conn->state == CONN_KEEPALIVE);
+    int tmpfd = conn->fd;
+    log_msg(LINFO, "Reusing connection on %d", tmpfd);
+    conn->fd = -1;
+    close_connection(conn, epoll_fd);
+    conn->fd = tmpfd;
+
+    conn->req = NULL;
+    conn->req_len = 0;
+    conn->method = NULL;
+    conn->url = NULL;
+    conn->host = NULL;
+    conn->content_length = 0;
+    conn->user_agent = NULL;
+    conn->content_type = NULL;
+    conn->authorization = NULL;
+    conn->keepalive = 0;
+    conn->header = NULL;
+    conn->header_len = 0;
+    conn->header_only = 0;
+    conn->resp_fd = -1;
+    conn->resp = NULL;
+    conn->resp_len = 0;
+
+    conn->state = CONN_READING;
+}
+
 #define DATE_LEN 30
 static char *rfc1123_date(char *dest, const time_t when)
 {
@@ -135,6 +293,16 @@ static char *rfc1123_date(char *dest, const time_t when)
         dest[0] = '\0';
 
     return dest;
+}
+
+static char *get_mime_type(const char *ext)
+{
+    for (size_t i = 0; i < MIME_COUNT; i++) {
+        if (strcmp(ext, mime_map[i].ext) == 0)
+            return mime_map[i].type;
+    }
+
+    return "application/octet-stream";
 }
 
 static void server_response(struct connection *conn, const int code,
@@ -179,7 +347,7 @@ static void server_response(struct connection *conn, const int code,
 
 static void process_get(struct connection *conn)
 {
-    char *target, *end;
+    char *target, *end, *type;
     char date[DATE_LEN];
     struct stat filestat;
 
@@ -197,7 +365,10 @@ static void process_get(struct connection *conn)
         (void)asprintf(&target, "%s%s", root_dir, conn->url);
     }
 
+    log_msg(LINFO, "GET %s", target);
+
     conn->resp_fd = open(target, O_RDONLY | O_NONBLOCK);
+    type = get_mime_type(strrchr(target, '.') + 1);
     free(target);
 
     if (conn->resp_fd == -1) {
@@ -214,6 +385,19 @@ static void process_get(struct connection *conn)
         }
     }
 
+    // stat file
+    if (fstat(conn->resp_fd, &filestat) == -1) {
+        server_response(conn, 500, "Internal Server Error",
+                        "fstat() failed: %s", strerror(errno));
+        return;
+    }
+    // check for regular file
+    if (!S_ISREG(filestat.st_mode)) {
+        server_response(conn, 403, "Forbidden", "Not a regular file");
+        return;
+    }
+    conn->resp_type = FILE_RESP;
+
     conn->resp_len = filestat.st_size;
     conn->header_len = asprintf(&(conn->header),
             "HTTP/1.1 200 OK\r\n"
@@ -227,8 +411,7 @@ static void process_get(struct connection *conn)
             server_header,
             conn->keepalive ? "keep-alive" : "close",
             conn->resp_len,
-            "text/html; charset=UTF-8");
-    conn->resp_type = FILE_RESP;
+            type);
 }
 
 /*
@@ -377,6 +560,7 @@ static void send_resp(struct connection *conn)
 {
     assert(conn->state == CONN_WRITING);
     ssize_t header_sent, resp_sent = 0;
+    off_t offset = 0;
 
     assert(conn->header_len == strlen(conn->header));
     header_sent = send(conn->fd, conn->header, conn->header_len, 0);
@@ -399,7 +583,7 @@ static void send_resp(struct connection *conn)
             resp_sent = send(conn->fd, conn->resp, conn->resp_len, 0);
             break;
         case FILE_RESP:
-            resp_sent = sendfile(conn->fd, conn->resp_fd, NULL, conn->resp_len);
+            resp_sent = sendfile(conn->fd, conn->resp_fd, &offset, conn->resp_len);
             break;
     }
     if (resp_sent < 1) {
@@ -464,8 +648,6 @@ static int init_socket()
         exit(EXIT_FAILURE);
     }
 
-    printf("Listening on port %s...\n", port);
-
     return fd;
 }
 
@@ -526,7 +708,9 @@ static void print_usage(const char *pname)
     printf("\t--daemon\n"
            "\t\tDetach process from terminal and run in background.\n");
     printf("\t--[no-]keepalive\n"
-           "\t\tEnable or disable keepalive functionality.\n\n");
+           "\t\tEnable or disable keepalive functionality.\n");
+    printf("\t--debug\n"
+           "\t\tEnable debug mode.\n\n");
 }
 
 static void parse_args(const int argc, char *argv[])
@@ -558,6 +742,8 @@ static void parse_args(const int argc, char *argv[])
             force_keepalive = 0;
         } else if (strcmp(argv[i], "--keepalive") == 0) {
             force_keepalive = 1;
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            debug_mode = 1;
         }
     }
 }
@@ -565,10 +751,17 @@ static void parse_args(const int argc, char *argv[])
 int main(int argc, char *argv[])
 {
     printf("%s\n", PKG_NAME);
+
+    now = time(NULL);
+    init_log(true, "lilyhttpd.log", false, LDEBUG);
+
     struct sigaction sa;
+
     parse_args(argc, argv);
     int server_fd = init_socket();
     set_nonblocking(server_fd);
+
+    log_msg(LINFO, "Server running on port %s", port);
 
     if (daemonize)
         daemon_start();
@@ -596,12 +789,20 @@ int main(int argc, char *argv[])
         int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         for (int i = 0; i < n; i++) {
             if (events[i].data.fd == server_fd) {
+                struct sockaddr_storage client_addr;
+                socklen_t addrlen;
+                char clientIP[INET6_ADDRSTRLEN];
                 // accept new conn
-                int client_fd = accept(server_fd, NULL, NULL);
+                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
                 struct connection *conn = new_connection();
                 conn->fd = client_fd;
                 set_nonblocking(conn->fd);
                 conn->state = CONN_READING;
+
+                log_msg(LINFO, "new connection %s",
+                        inet_ntop(client_addr.ss_family,
+                                  get_in_addr((struct sockaddr *)&client_addr),
+                                  clientIP, INET6_ADDRSTRLEN));
 
                 struct epoll_event client_ev = {0};
                 client_ev.events = EPOLLIN;
@@ -616,7 +817,14 @@ int main(int argc, char *argv[])
                     send_resp(conn);
                 }
 
-                if (conn->state == CONN_CLOSING) {
+                if (conn->state == CONN_KEEPALIVE) {
+                    keepalive_connection(conn, epoll_fd);
+
+                    struct epoll_event ev = {0};
+                    ev.events = EPOLLIN;
+                    ev.data.ptr = conn;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
+                } else if (conn->state == CONN_CLOSING) {
                     close_connection(conn, epoll_fd);
                 }
             }

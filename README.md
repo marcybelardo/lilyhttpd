@@ -10,7 +10,8 @@ $ lilyhttpd [path to directory root]
 Options:
 
 ```bash
---daemon         initialize process as a daemon
---port           set port (defaults to 8080)
---no-keepalive   turn off keep-alive
+--daemon           initialize process as a daemon
+--port             set port (defaults to 8080)
+--[no-]keepalive   turn off/on keep-alive
+--debug            turn on debug mode
 ```
