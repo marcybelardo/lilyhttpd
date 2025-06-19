@@ -60,7 +60,7 @@ static const char *server_header = "Server: lilyhttpd";
 static char *root_dir = NULL;
 static char *port = "8080";
 static int daemonize = 0;
-static int force_keepalive = 0;
+static int no_keepalive = 0;
 static time_t now;
 static LogLevel current_log_level = LDEBUG;
 static int debug_mode = 0;
@@ -72,7 +72,6 @@ struct connection {
     enum {
         CONN_READING,
         CONN_WRITING,
-        CONN_KEEPALIVE,
         CONN_CLOSING
     } state;
 
@@ -258,7 +257,7 @@ static void close_connection(struct connection *conn, int epoll_fd)
 
 static void keepalive_connection(struct connection *conn, int epoll_fd)
 {
-    assert(conn->state == CONN_KEEPALIVE);
+    assert(conn->state == CONN_CLOSING);
     int tmpfd = conn->fd;
     log_msg(LINFO, "Reusing connection on %d", tmpfd);
     conn->fd = -1;
@@ -330,6 +329,7 @@ static void server_response(struct connection *conn, const int code,
         "HTTP/1.1 %d %s\r\n"
         "Date: %s\r\n"
         "%s\r\n"
+        "Accept-Ranges: bytes\r\n"
         "Connection: %s\r\n"
         "Content-Length: %zu\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
@@ -414,6 +414,11 @@ static void process_get(struct connection *conn)
             type);
 }
 
+// static void parse_range_header(struct connection *conn, const char *field)
+// {
+//
+// }
+
 /*
  * Returns the number of bytes parsed in the request up to the request body
  * or -1 on error
@@ -484,8 +489,10 @@ static int parse_request(struct connection *conn)
             else if (strcasecmp(current_value, "close") == 0)
                 conn->keepalive = 0;
 
-            if (force_keepalive) conn->keepalive = 1;
+            if (no_keepalive) conn->keepalive = 0;
         }
+        else if (strcasecmp(current_value, "Range") == 0)
+            parse_range_header(conn);
         else if (strcasecmp(current_header, "Host") == 0)
             conn->host = current_value;
         else if (strcasecmp(current_header, "User-Agent") == 0)
@@ -707,8 +714,8 @@ static void print_usage(const char *pname)
     printf("\t\tPort to listen on for connections.\n");
     printf("\t--daemon\n"
            "\t\tDetach process from terminal and run in background.\n");
-    printf("\t--[no-]keepalive\n"
-           "\t\tEnable or disable keepalive functionality.\n");
+    printf("\t--no-keepalive\n"
+           "\t\tForce disable keepalive functionality.\n");
     printf("\t--debug\n"
            "\t\tEnable debug mode.\n\n");
 }
@@ -739,9 +746,7 @@ static void parse_args(const int argc, char *argv[])
         } else if (strcmp(argv[i], "--daemon") == 0) {
             daemonize = 1;
         } else if (strcmp(argv[i], "--no-keepalive") == 0) {
-            force_keepalive = 0;
-        } else if (strcmp(argv[i], "--keepalive") == 0) {
-            force_keepalive = 1;
+            no_keepalive = 0;
         } else if (strcmp(argv[i], "--debug") == 0) {
             debug_mode = 1;
         }
@@ -817,15 +822,17 @@ int main(int argc, char *argv[])
                     send_resp(conn);
                 }
 
-                if (conn->state == CONN_KEEPALIVE) {
-                    keepalive_connection(conn, epoll_fd);
+                if (conn->state == CONN_CLOSING) {
+                    if (conn->keepalive) {
+                        keepalive_connection(conn, epoll_fd);
 
-                    struct epoll_event ev = {0};
-                    ev.events = EPOLLIN;
-                    ev.data.ptr = conn;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
-                } else if (conn->state == CONN_CLOSING) {
-                    close_connection(conn, epoll_fd);
+                        struct epoll_event ev = {0};
+                        ev.events = EPOLLIN;
+                        ev.data.ptr = conn;
+                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
+                    } else {
+                        close_connection(conn, epoll_fd);
+                    }
                 }
             }
         }
