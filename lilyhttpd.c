@@ -491,8 +491,8 @@ static int parse_request(struct connection *conn)
 
             if (no_keepalive) conn->keepalive = 0;
         }
-        else if (strcasecmp(current_value, "Range") == 0)
-            parse_range_header(conn);
+        // else if (strcasecmp(current_value, "Range") == 0)
+        //     parse_range_header(conn);
         else if (strcasecmp(current_header, "Host") == 0)
             conn->host = current_value;
         else if (strcasecmp(current_header, "User-Agent") == 0)
@@ -804,10 +804,11 @@ int main(int argc, char *argv[])
                 set_nonblocking(conn->fd);
                 conn->state = CONN_READING;
 
-                log_msg(LINFO, "new connection %s",
+                log_msg(LINFO, "new connection %s on socket %d",
                         inet_ntop(client_addr.ss_family,
                                   get_in_addr((struct sockaddr *)&client_addr),
-                                  clientIP, INET6_ADDRSTRLEN));
+                                  clientIP, INET6_ADDRSTRLEN),
+                        conn->fd);
 
                 struct epoll_event client_ev = {0};
                 client_ev.events = EPOLLIN;
