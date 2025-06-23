@@ -304,12 +304,100 @@ static char *get_mime_type(const char *ext)
     return "application/octet-stream";
 }
 
-/*
- * gotta implement these
- * static char *decode_url(char *url);
- * static char *normalize_path(char *url);
- * static char *sanitize_url(char *url);
-*/
+#define UPPER_HEX_OFFSET 55
+#define LOWER_HEX_OFFSET 87
+#define NUM_HEX_OFFSET 48
+
+static inline int hex_to_num(char c)
+{
+    if (isupper(c))
+        return c - UPPER_HEX_OFFSET;
+    else if (isalpha(c))
+        return c - LOWER_HEX_OFFSET;
+    else
+        return c - NUM_HEX_OFFSET;
+}
+
+static char *decode_url(char *url)
+{
+    size_t i, pos, len = strlen(url);
+    char *out = malloc(len + 1);
+
+    for (i = 0, pos = 0; i < len; i++) {
+        if ((url[i] == '%') && (i + 2 < len)) {
+            if (isxdigit(url[i + 1]) && isxdigit(url[i + 2])) {
+                out[pos++] = hex_to_num(url[i + 1]) * 16 +
+                            hex_to_num(url[i + 2]);
+                i += 2;
+            }
+        } else {
+            out[pos++] = url[i];
+        }
+    }
+    out[pos] = '\0';
+
+    return out;
+}
+
+static char *sanitize_url(char *const url)
+{
+    char *src = url;
+    char *out;
+
+    if (url[0] != '/')
+        return NULL;
+
+    out = src;
+    while (*src) {
+        // multi slashes should be collapsed into one slash
+        // single dot dirs can be ignored
+        // double dot dirs should be traversed, or treated as malicious
+
+        if (*src != '/') {
+            *out++ = *src++;
+            continue;
+        }
+
+        // assuming current char is a slash
+        // we start evaluating on the next char
+
+        // keep skipping consecutive slashes
+        if (*++src == '/')
+            continue;
+
+        // if we're out of slashes and not dealing with dot dirs
+        // we can set the next char as a slash
+        else if (*src != '.')
+            *out++ = '/';
+
+        // if the next char is a dot, check if it is a dot dir
+        else if (*(src + 1) == '/')
+            src++;
+
+        // found a double dot dir
+        else if (*(src + 1) == '.' && *(src + 2) == '/') {
+            src += 2;
+
+            // no previous directory to go to
+            // so it's an illegal URL
+            if (out == url)
+                return NULL;
+
+            // walk back to the last available directory
+            else
+                for (; *out != '/'; out--);
+        }
+
+        else
+            *out++ = '/';
+    }
+
+    if (out == url)
+        out++;
+    *out = '\0';
+
+    return url;
+}
 
 static void server_response(struct connection *conn, const int code,
                      const char *ename, const char *format, ...)
@@ -354,7 +442,7 @@ static void server_response(struct connection *conn, const int code,
 
 static void process_get(struct connection *conn)
 {
-    char *target, *end, *type;
+    char *target, *end, *decoded, *type;
     char date[DATE_LEN];
     // char absolute_path[PATH_MAX];
     struct stat filestat;
@@ -363,25 +451,33 @@ static void process_get(struct connection *conn)
         *end = '\0';
 
     // decode URL
-    // get the correct path of file
+    // free this!
+    decoded = decode_url(conn->url);
     // ensure path safety
+    if (!(sanitize_url(decoded))) {
+        server_response(conn, 400, "Bad Request", "The URL you requested is invalid");
+        free(decoded);
+        return;
+    }
 
     if (conn->url[strlen(conn->url) - 1] == '/') {
         // if path ends with '/', get the index file
-        (void)asprintf(&target, "%s%s%s", root_dir, conn->url, index_name);
+        (void)asprintf(&target, "%s%s%s", root_dir, decoded, index_name);
         if ((stat(target, &filestat) == -1) && (errno == ENOENT)) {
             free(target);
+            free(decoded);
             server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
             return;
         }
     } else {
-        (void)asprintf(&target, "%s%s", root_dir, conn->url);
+        (void)asprintf(&target, "%s%s", root_dir, decoded);
     }
 
     log_msg(LINFO, "GET %s", target);
 
     conn->resp_fd = open(target, O_RDONLY | O_NONBLOCK);
     type = get_mime_type(strrchr(target, '.') + 1);
+    free(decoded);
     free(target);
 
     if (conn->resp_fd == -1) {
