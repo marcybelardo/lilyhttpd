@@ -304,6 +304,13 @@ static char *get_mime_type(const char *ext)
     return "application/octet-stream";
 }
 
+/*
+ * gotta implement these
+ * static char *decode_url(char *url);
+ * static char *normalize_path(char *url);
+ * static char *sanitize_url(char *url);
+*/
+
 static void server_response(struct connection *conn, const int code,
                      const char *ename, const char *format, ...)
 {
@@ -349,10 +356,15 @@ static void process_get(struct connection *conn)
 {
     char *target, *end, *type;
     char date[DATE_LEN];
+    // char absolute_path[PATH_MAX];
     struct stat filestat;
 
     if ((end = strchr(conn->url, '?')) != NULL)
         *end = '\0';
+
+    // decode URL
+    // get the correct path of file
+    // ensure path safety
 
     if (conn->url[strlen(conn->url) - 1] == '/') {
         // if path ends with '/', get the index file
@@ -360,6 +372,7 @@ static void process_get(struct connection *conn)
         if ((stat(target, &filestat) == -1) && (errno == ENOENT)) {
             free(target);
             server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
+            return;
         }
     } else {
         (void)asprintf(&target, "%s%s", root_dir, conn->url);
@@ -375,13 +388,14 @@ static void process_get(struct connection *conn)
         switch (errno) {
             case EACCES:
                 server_response(conn, 403, "Forbidden", "You do not have permission to access this URL");
-                break;
+                return;
             case ENOENT:
                 server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
-                break;
+                return;
             default:
                 server_response(conn, 500, "Internal Server Error",
                                 "The URL you requested cannot be opened: %s", strerror(errno));
+                return;
         }
     }
 
