@@ -259,7 +259,6 @@ static void keepalive_connection(struct connection *conn, int epoll_fd)
 {
     assert(conn->state == CONN_CLOSING);
     int tmpfd = conn->fd;
-    log_msg(LINFO, "Reusing connection on %d", tmpfd);
     conn->fd = -1;
     close_connection(conn, epoll_fd);
     conn->fd = tmpfd;
@@ -324,12 +323,20 @@ static void server_response(struct connection *conn, const int code,
     rfc1123_date(date, now);
 
     conn->resp_len = asprintf(&(conn->resp),
-        "<!DOCTYPE html><html><head><title>%d %s</title></head><body>\n"
-        "<h1>%d %s</h1>\n"
-        "<hr>\n"
-        "%s\n"
-        "</body></html>\n",
-        code, ename, code, ename, reason);
+        "<!DOCTYPE html><html><head><title>%d %s</title></head><body>\r\n"
+        "<h1>%d %s</h1>\r\n"
+        "%s\r\n"
+        "<hr>\r\n"
+        "<em>Server: %s [%s]</em>\r\n"
+        "</body></html>\r\n",
+        code,
+        ename,
+        code,
+        ename,
+        reason,
+        PKG_NAME,
+        date
+    );
     free(reason);
 
     conn->header_len = asprintf(&(conn->header),
@@ -354,7 +361,7 @@ static void server_response(struct connection *conn, const int code,
 
 static void process_get(struct connection *conn)
 {
-    char *target, *end, *type;
+    char *target, *end, *type_start, *type;
     char date[DATE_LEN];
     // char absolute_path[PATH_MAX];
     struct stat filestat;
@@ -370,32 +377,36 @@ static void process_get(struct connection *conn)
         // if path ends with '/', get the index file
         (void)asprintf(&target, "%s%s%s", root_dir, conn->url, index_name);
         if ((stat(target, &filestat) == -1) && (errno == ENOENT)) {
-            free(target);
             server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
-            return;
+            goto clean_target;
         }
     } else {
         (void)asprintf(&target, "%s%s", root_dir, conn->url);
     }
 
-    log_msg(LINFO, "GET %s", target);
+    log_msg(LINFO, "%s %s", conn->method, target);
+
+    if ((type_start = strrchr(target, '.')) == NULL) {
+        server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
+        goto clean_target;
+    }
+    type = get_mime_type(type_start + 1);
 
     conn->resp_fd = open(target, O_RDONLY | O_NONBLOCK);
-    type = get_mime_type(strrchr(target, '.') + 1);
     free(target);
 
     if (conn->resp_fd == -1) {
         switch (errno) {
-            case EACCES:
-                server_response(conn, 403, "Forbidden", "You do not have permission to access this URL");
-                return;
-            case ENOENT:
-                server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
-                return;
-            default:
-                server_response(conn, 500, "Internal Server Error",
-                                "The URL you requested cannot be opened: %s", strerror(errno));
-                return;
+        case EACCES:
+            server_response(conn, 403, "Forbidden", "You do not have permission to access this URL");
+            return;
+        case ENOENT:
+            server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
+            return;
+        default:
+            server_response(conn, 500, "Internal Server Error",
+                            "The URL you requested cannot be opened: %s", strerror(errno));
+            return;
         }
     }
 
@@ -411,7 +422,6 @@ static void process_get(struct connection *conn)
         return;
     }
     conn->resp_type = FILE_RESP;
-
     conn->resp_len = filestat.st_size;
     conn->header_len = asprintf(&(conn->header),
             "HTTP/1.1 200 OK\r\n"
@@ -426,6 +436,13 @@ static void process_get(struct connection *conn)
             conn->keepalive ? "keep-alive" : "close",
             conn->resp_len,
             type);
+
+    return;
+
+clean_target:
+    log_msg(LDEBUG, "Cleaning target for %s", target);
+    free(target);
+    return;
 }
 
 // static void parse_range_header(struct connection *conn, const char *field)
