@@ -410,6 +410,9 @@ static void server_response(struct connection *conn, const int code,
 
     rfc1123_date(date, now);
 
+    log_msg(LINFO, "%d %s - %s %s HTTP/1.1",
+            code, ename, conn->method, conn->url);
+
     conn->resp_len = asprintf(&(conn->resp),
         "<!DOCTYPE html><html><head><title>%d %s</title></head><body>\r\n"
         "<h1>%d %s</h1>\r\n"
@@ -477,8 +480,6 @@ static void process_get(struct connection *conn)
         (void)asprintf(&target, "%s%s", root_dir, decoded);
     }
 
-    log_msg(LINFO, "%s %s", conn->method, target);
-
     if ((type_start = strrchr(target, '.')) == NULL) {
         server_response(conn, 404, "Not Found", "The URL you requested cannot be found");
         goto clean;
@@ -516,6 +517,10 @@ static void process_get(struct connection *conn)
         server_response(conn, 403, "Forbidden", "Not a regular file");
         return;
     }
+
+    log_msg(LINFO, "%s %s HTTP/1.1 [%s]",
+            conn->method, conn->url, conn->user_agent);
+
     conn->resp_type = FILE_RESP;
     conn->resp_len = filestat.st_size;
     conn->header_len = asprintf(&(conn->header),
