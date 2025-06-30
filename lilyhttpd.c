@@ -84,6 +84,7 @@ struct connection {
     char *user_agent;
     char *content_type;
     char *authorization;
+    char *if_modified_since;
     int keepalive;
 
     char *header;
@@ -220,6 +221,7 @@ static struct connection *new_connection()
     conn->user_agent = NULL;
     conn->content_type = NULL;
     conn->authorization = NULL;
+    conn->if_modified_since = NULL;
     conn->keepalive = 0;
     conn->header = NULL;
     conn->header_len = 0;
@@ -272,6 +274,7 @@ static void keepalive_connection(struct connection *conn, int epoll_fd)
     conn->user_agent = NULL;
     conn->content_type = NULL;
     conn->authorization = NULL;
+    conn->if_modified_since = NULL;
     conn->keepalive = 0;
     conn->header = NULL;
     conn->header_len = 0;
@@ -453,7 +456,7 @@ static void server_response(struct connection *conn, const int code,
 static void process_get(struct connection *conn)
 {
     char *target, *end, *decoded, *type_start, *type;
-    char date[DATE_LEN];
+    char date[DATE_LEN], last_modified[DATE_LEN];
     // char absolute_path[PATH_MAX];
     struct stat filestat;
 
@@ -518,6 +521,27 @@ static void process_get(struct connection *conn)
         return;
     }
 
+    rfc1123_date(last_modified, filestat.st_mtim.tv_sec);
+
+    if ((conn->if_modified_since) &&
+        (strcmp(conn->if_modified_since, last_modified) == 0))
+    {
+        conn->header_len = asprintf(&(conn->header),
+            "HTTP/1.1 304 Not Modified\r\n"
+            "Date: %s\r\n"
+            "%s\r\n"
+            "Connection: %s\r\n"
+            "\r\n",
+            rfc1123_date(date, now),
+            server_header,
+            conn->keepalive ? "keep-alive" : "close"
+        );
+        conn->resp_len = 0;
+        conn->resp_type = SERV_RESP;
+        conn->header_only = 1;
+        return;
+    }
+
     log_msg(LINFO, "%s %s HTTP/1.1 [%s]",
             conn->method, conn->url, conn->user_agent);
 
@@ -530,12 +554,15 @@ static void process_get(struct connection *conn)
             "Connection: %s\r\n" // keepalive
             "Content-Length: %zu\r\n"
             "Content-Type: %s\r\n"
+            "Last-Modified: %s\r\n"
             "\r\n",
             rfc1123_date(date, now),
             server_header,
             conn->keepalive ? "keep-alive" : "close",
             conn->resp_len,
-            type);
+            type,
+            last_modified
+    );
 
     return;
 
@@ -634,6 +661,8 @@ static int parse_request(struct connection *conn)
             conn->content_type = current_value;
         else if (strcasecmp(current_header, "Authorization") == 0)
             conn->authorization = current_value;
+        else if (strcasecmp(current_header, "If-Modified-Since") == 0)
+            conn->if_modified_since = current_value;
         else if (strcasecmp(current_header, "Content-Length") == 0) {
             conn->content_length = atol(current_value);
         }
