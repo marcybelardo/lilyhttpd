@@ -27,7 +27,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static const char PKG_NAME[] = "lilyhttpd v0.1.0";
+static const char PKG_NAME[] = "lilyhttpd v0.2.0";
 
 #define MAX_EVENTS 1024
 
