@@ -136,7 +136,7 @@ static const struct mime_type mime_map[27] = {
     {"xml", "application/xml"},
 };
 
-void init_log(int enable_debug, const char *log_path, int enable_syslog, LogLevel level)
+static void init_log(int enable_debug, const char *log_path, int enable_syslog, LogLevel level)
 {
     debug_mode = enable_debug;
     current_log_level = level;
@@ -156,7 +156,7 @@ void init_log(int enable_debug, const char *log_path, int enable_syslog, LogLeve
     }
 }
 
-void log_msg(LogLevel level, const char *fmt, ...)
+static void log_msg(LogLevel level, const char *fmt, ...)
 {
     if (level < current_log_level)
         return;
@@ -191,7 +191,7 @@ void log_msg(LogLevel level, const char *fmt, ...)
     va_end(args);
 }
 
-void close_log()
+static void close_log()
 {
     if (log_file && log_file != stderr)
         fclose(log_file);
@@ -199,7 +199,7 @@ void close_log()
         closelog();
 }
 
-void *get_in_addr(struct sockaddr *sa)
+static void *get_in_addr(struct sockaddr *sa)
 {
     if (sa->sa_family == AF_INET)
         return &(((struct sockaddr_in *)sa)->sin_addr);
