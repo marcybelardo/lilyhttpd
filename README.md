@@ -11,7 +11,7 @@ Options:
 
 ```bash
 --daemon           initialize process as a daemon
---port             set port (defaults to 8080)
---[no-]keepalive   turn off/on keep-alive
+--port             specify port (defaults to 8080)
+--no-keepalive     turn off/on keep-alive
 --debug            turn on debug mode
 ```
