@@ -11,6 +11,7 @@
 #include <inttypes.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -19,7 +20,6 @@
 #include <string.h>
 #include <sys/syslog.h>
 #include <syslog.h>
-#include <sys/epoll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -254,7 +254,8 @@ static void close_connection(struct connection *conn, int epoll_fd)
     if (conn->resp_fd != -1) close(conn->resp_fd);
     if (conn->resp != NULL) free(conn->resp);
 
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
+    // REPLACE WITH POLL REMOVAL
+    /* epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL); */
 }
 
 static void keepalive_connection(struct connection *conn, int epoll_fd)
@@ -718,11 +719,11 @@ static void recv_req(struct connection *conn, int epoll_fd)
 
     conn->state = CONN_WRITING;
 
-    // switch to EPOLLOUT
-    struct epoll_event ev = {0};
-    ev.events = EPOLLOUT;
-    ev.data.ptr = conn;
-    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
+    // replace with poll handling! IDK if there even is something for this
+    /* struct epoll_event ev = {0}; */
+    /* ev.events = EPOLLOUT; */
+    /* ev.data.ptr = conn; */
+    /* epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev); */
 }
 
 static void send_resp(struct connection *conn)
@@ -944,64 +945,65 @@ int main(int argc, char *argv[])
     if (daemonize)
         daemon_finish();
 
-    int epoll_fd = epoll_create1(0);
-    struct epoll_event ev = {0};
-    ev.events = EPOLLIN;
-    ev.data.fd = server_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+    // REPLACE WITH POLL STUFF HERE
+    /* int epoll_fd = epoll_create1(0); */
+    /* struct epoll_event ev = {0}; */
+    /* ev.events = EPOLLIN; */
+    /* ev.data.fd = server_fd; */
+    /* epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev); */
 
-    struct epoll_event events[MAX_EVENTS];
+    /* struct epoll_event events[MAX_EVENTS]; */
 
-    for (;;) {
-        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        for (int i = 0; i < n; i++) {
-            if (events[i].data.fd == server_fd) {
-                struct sockaddr_storage client_addr;
-                socklen_t addrlen;
-                char clientIP[INET6_ADDRSTRLEN];
-                // accept new conn
-                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
-                struct connection *conn = new_connection();
-                conn->fd = client_fd;
-                set_nonblocking(conn->fd);
-                conn->state = CONN_READING;
+    /* for (;;) { */
+    /*     int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1); */
+    /*     for (int i = 0; i < n; i++) { */
+    /*         if (events[i].data.fd == server_fd) { */
+    /*             struct sockaddr_storage client_addr; */
+    /*             socklen_t addrlen; */
+    /*             char clientIP[INET6_ADDRSTRLEN]; */
+    /*             // accept new conn */
+    /*             int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen); */
+    /*             struct connection *conn = new_connection(); */
+    /*             conn->fd = client_fd; */
+    /*             set_nonblocking(conn->fd); */
+    /*             conn->state = CONN_READING; */
 
-                log_msg(LINFO, "new connection %s on socket %d",
-                        inet_ntop(client_addr.ss_family,
-                                  get_in_addr((struct sockaddr *)&client_addr),
-                                  clientIP, INET6_ADDRSTRLEN),
-                        conn->fd);
+    /*             log_msg(LINFO, "new connection %s on socket %d", */
+    /*                     inet_ntop(client_addr.ss_family, */
+    /*                               get_in_addr((struct sockaddr *)&client_addr), */
+    /*                               clientIP, INET6_ADDRSTRLEN), */
+    /*                     conn->fd); */
 
-                struct epoll_event client_ev = {0};
-                client_ev.events = EPOLLIN;
-                client_ev.data.ptr = conn;
-                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev);
-            } else {
-                now = time(NULL);
-                struct connection *conn = events[i].data.ptr;
-                if (conn->state == CONN_READING && (events[i].events & EPOLLIN)) {
-                    recv_req(conn, epoll_fd);
-                } else if (conn->state == CONN_WRITING && (events[i].events & EPOLLOUT)) {
-                    send_resp(conn);
-                }
+    /*             struct epoll_event client_ev = {0}; */
+    /*             client_ev.events = EPOLLIN; */
+    /*             client_ev.data.ptr = conn; */
+    /*             epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev); */
+    /*         } else { */
+    /*             now = time(NULL); */
+    /*             struct connection *conn = events[i].data.ptr; */
+    /*             if (conn->state == CONN_READING && (events[i].events & EPOLLIN)) { */
+    /*                 recv_req(conn, epoll_fd); */
+    /*             } else if (conn->state == CONN_WRITING && (events[i].events & EPOLLOUT)) { */
+    /*                 send_resp(conn); */
+    /*             } */
 
-                if (conn->state == CONN_CLOSING) {
-                    if (conn->keepalive) {
-                        keepalive_connection(conn, epoll_fd);
+    /*             if (conn->state == CONN_CLOSING) { */
+    /*                 if (conn->keepalive) { */
+    /*                     keepalive_connection(conn, epoll_fd); */
 
-                        struct epoll_event ev = {0};
-                        ev.events = EPOLLIN;
-                        ev.data.ptr = conn;
-                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
-                    } else {
-                        close_connection(conn, epoll_fd);
-                    }
-                }
-            }
-        }
-    }
+    /*                     struct epoll_event ev = {0}; */
+    /*                     ev.events = EPOLLIN; */
+    /*                     ev.data.ptr = conn; */
+    /*                     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev); */
+    /*                 } else { */
+    /*                     close_connection(conn, epoll_fd); */
+    /*                 } */
+    /*             } */
+    /*         } */
+    /*     } */
+    /* } */
 
     close(server_fd);
-    close(epoll_fd);
+    /* close(epoll_fd); */
     return 0;
 }
