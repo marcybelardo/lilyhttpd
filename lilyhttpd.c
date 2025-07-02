@@ -30,6 +30,7 @@
 static const char PKG_NAME[] = "lilyhttpd v0.2.0";
 
 #define MAX_EVENTS 1024
+#define TIMEOUT_SECS 10
 
 static void sigchld_handler(int s)
 {
@@ -57,6 +58,8 @@ static const char *log_level_names[] = {
 
 static const char *index_name = "index.html";
 static const char *server_header = "Server: lilyhttpd";
+static int running = 1;
+static int server_fd = -1;
 static char *root_dir = NULL;
 static char *port = "8080";
 static int daemonize = 0;
@@ -916,6 +919,32 @@ static void parse_args(const int argc, char *argv[])
     }
 }
 
+static void server_process()
+{
+    struct pollfd pfds[MAX_EVENTS];
+    int ret;
+    size_t fd_count = 0;
+
+    pfds[0].fd = server_fd;
+    pfds[0].events = POLLIN;
+    fd_count++;
+
+    for (;;) {
+        ret = poll(pfds, fd_count, TIMEOUT_SECS * 1000);
+        if (ret == -1) {
+            perror("poll");
+            exit(EXIT_FAILURE);
+        }
+
+        for (size_t i = 0; i < fd_count; i++) {
+            if (pfds[i].fd == server_fd) {
+                // accept_conn()
+                // takes in the server_fd, pfds array?
+            }
+        }
+    }
+}
+
 int main(int argc, char *argv[])
 {
     printf("%s\n", PKG_NAME);
@@ -926,7 +955,12 @@ int main(int argc, char *argv[])
     struct sigaction sa;
 
     parse_args(argc, argv);
-    int server_fd = init_socket();
+    server_fd = init_socket();
+    if (server_fd == -1) {
+        fprintf(stderr, "main init_socket(): %s",
+                strerror(errno));
+        exit(EXIT_FAILURE);
+    }
     set_nonblocking(server_fd);
 
     log_msg(LINFO, "Server running on port %s", port);
@@ -944,6 +978,9 @@ int main(int argc, char *argv[])
 
     if (daemonize)
         daemon_finish();
+
+    if (running)
+        server_process();
 
     // REPLACE WITH POLL STUFF HERE
     /* int epoll_fd = epoll_create1(0); */
