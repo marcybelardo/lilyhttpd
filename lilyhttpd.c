@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/syslog.h>
 #include <syslog.h>
 #include <sys/sendfile.h>
@@ -68,6 +69,13 @@ struct connection {
     char *authorization;
     char *if_modified_since;
     int keepalive;
+    int compress;
+    enum {
+        GZIP,
+        DEFLATE,
+        BR,
+        ZSTD
+    } compression;
 
     char *header;
     size_t header_len;
@@ -87,8 +95,8 @@ struct mime_type {
     char *type;
 };
 
-#define MIME_COUNT 27
-static const struct mime_type mime_map[27] = {
+#define MIME_COUNT 28
+static const struct mime_type mime_map[MIME_COUNT] = {
     {"bin", "application/octet-stream"},
     {"bmp", "image/bmp"},
     {"css", "text/css"},
@@ -116,6 +124,7 @@ static const struct mime_type mime_map[27] = {
     {"woff", "font/woff"},
     {"woff2", "font/woff2"},
     {"xml", "application/xml"},
+    {NULL, "application/octet-stream"},
 };
 
 /*
@@ -243,6 +252,7 @@ static struct connection *new_connection()
     conn->authorization = NULL;
     conn->if_modified_since = NULL;
     conn->keepalive = 0;
+    conn->compress = 0;
     conn->header = NULL;
     conn->header_len = 0;
     conn->header_only = 0;
@@ -297,6 +307,7 @@ static void keepalive_connection(struct connection *conn, int client_fd, size_t 
     conn->authorization = NULL;
     conn->if_modified_since = NULL;
     conn->keepalive = 0;
+    conn->compress = 0;
     conn->header = NULL;
     conn->header_len = 0;
     conn->header_only = 0;
@@ -383,6 +394,14 @@ static char *get_mime_type(const char *ext)
     }
 
     return "application/octet-stream";
+}
+
+static bool should_compress(const char *mime_type)
+{
+    return strncmp(mime_type, "text/", 5) == 0 ||
+                strcmp(mime_type, "application/javascript") == 0 ||
+                strcmp(mime_type, "application/json") == 0 ||
+                strcmp(mime_type, "image/svg+xml") == 0;
 }
 
 #define UPPER_HEX_OFFSET 55
@@ -630,6 +649,10 @@ static void process_get(struct connection *conn)
 
     conn->resp_type = FILE_RESP;
     conn->resp_len = filestat.st_size;
+
+    if (conn->resp_len > 2048 && should_compress(type))
+        conn->compress = 1;
+
     conn->header_len = asprintf(&(conn->header),
             "HTTP/1.1 200 OK\r\n"
             "Date: %s\r\n"
@@ -637,6 +660,7 @@ static void process_get(struct connection *conn)
             "Connection: %s\r\n" // keepalive
             "Content-Length: %zu\r\n"
             "Content-Type: %s\r\n"
+            "%s" // content-encoding
             "Last-Modified: %s\r\n"
             "\r\n",
             rfc1123_date(date, now),
@@ -644,6 +668,7 @@ static void process_get(struct connection *conn)
             conn->keepalive ? "keep-alive" : "close",
             conn->resp_len,
             type,
+            conn->compress ? "Content-Encoding: gzip\r\n" : "",
             last_modified
     );
 
@@ -657,10 +682,57 @@ clean:
     return;
 }
 
-// static void parse_range_header(struct connection *conn, const char *field)
-// {
-//
-// }
+static void parse_compression_algorithm(struct connection *conn, char *field)
+{
+    size_t i = 0;
+    size_t len = strlen(field);
+    double highest_qval = -1.0f;
+    char *current_compression;
+
+    do {
+        char *algo = NULL;
+        size_t algo_start = i;
+        double qval = 0.0f;
+
+        for (; i < len &&
+            field[i] != ',' &&
+            field[i] != ';' &&
+            field[i] != '\0'; i++);
+
+        if (field[i] == ';') {
+            field[i] = '\0';
+            algo = &field[algo_start];
+            i += 3;
+            size_t qval_pos = i;
+            for (; i < len && field[i] != ','; i++);
+            field[i] = '\0';
+            qval = strtod(&field[qval_pos], NULL);
+            i += 2;
+        } else if (field[i] == ',' || field[i] == '\0') {
+            field[i] = '\0';
+            algo = &field[algo_start];
+            i += 2;
+            qval = 0.0f;
+        }
+
+        if (highest_qval > qval)
+            continue;
+        else
+            highest_qval = qval;
+
+        current_compression = algo;
+    } while (i < len);
+
+    if (strcasecmp(current_compression, "gzip") == 0 ||
+            strcasecmp(current_compression, "*") == 0)
+        conn->compression = GZIP;
+    else if (strcasecmp(current_compression, "deflate") == 0)
+        conn->compression = DEFLATE;
+    else if (strcasecmp(current_compression, "br") == 0)
+        conn->compression = BR;
+    else if (strcasecmp(current_compression, "zstd") == 0)
+        conn->compression = ZSTD;
+}
 
 /*
  * Returns the number of bytes parsed in the request up to the request body
@@ -734,8 +806,8 @@ static int parse_request(struct connection *conn)
 
             if (no_keepalive) conn->keepalive = 0;
         }
-        // else if (strcasecmp(current_value, "Range") == 0)
-        //     parse_range_header(conn);
+        else if (strcasecmp(current_header, "Accept-Encoding") == 0)
+            parse_compression_algorithm(conn, current_value);
         else if (strcasecmp(current_header, "Host") == 0)
             conn->host = current_value;
         else if (strcasecmp(current_header, "User-Agent") == 0)
@@ -747,7 +819,7 @@ static int parse_request(struct connection *conn)
         else if (strcasecmp(current_header, "If-Modified-Since") == 0)
             conn->if_modified_since = current_value;
         else if (strcasecmp(current_header, "Content-Length") == 0) {
-            conn->content_length = atol(current_value);
+            conn->content_length = strtol(current_value, NULL, 10);
         }
     } while (i + 4 <= len &&
         buf[i] != '\r' &&
