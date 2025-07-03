@@ -1023,7 +1023,6 @@ static void server_process()
 
                 if (conn->state == CONN_WRITING) {
                     send_resp(conn, client_fd);
-                    continue;
                 }
 
                 if (conn->state == CONN_CLOSING) {
