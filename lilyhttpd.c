@@ -27,20 +27,14 @@
 #include <time.h>
 #include <unistd.h>
 
+/*
+ * Defines and structs
+ */
+
 static const char PKG_NAME[] = "lilyhttpd v0.2.0";
 
 #define MAX_EVENTS 1024
 #define TIMEOUT_SECS 10
-
-static void sigchld_handler(int s)
-{
-    (void)s;
-
-    // waitpid() might overwrite errno, so we save and restore it:
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0);
-    errno = saved_errno;
-}
 
 typedef enum {
     LDEBUG = 0,
@@ -56,22 +50,7 @@ static const char *log_level_names[] = {
     "ERROR"
 };
 
-static const char *index_name = "index.html";
-static const char *server_header = "Server: lilyhttpd";
-static int running = 1;
-static int server_fd = -1;
-static char *root_dir = NULL;
-static char *port = "8080";
-static int daemonize = 0;
-static int no_keepalive = 0;
-static time_t now;
-static LogLevel current_log_level = LDEBUG;
-static int debug_mode = 0;
-static FILE *log_file = NULL;
-static int use_syslog = 0;
-
 struct connection {
-    int fd;
     enum {
         CONN_READING,
         CONN_WRITING,
@@ -139,6 +118,41 @@ static const struct mime_type mime_map[27] = {
     {"xml", "application/xml"},
 };
 
+/*
+ * Globals
+ */
+
+static struct pollfd pfds[MAX_EVENTS];
+static struct connection *conns[MAX_EVENTS];
+static size_t conn_count = 0;
+static const char *index_name = "index.html";
+static const char *server_header = "Server: lilyhttpd";
+static int running = 1;
+static int server_fd = -1;
+static char *root_dir = NULL;
+static char *port = "8080";
+static int daemonize = 0;
+static int no_keepalive = 0;
+static time_t now;
+static LogLevel current_log_level = LDEBUG;
+static int debug_mode = 0;
+static FILE *log_file = NULL;
+static int use_syslog = 0;
+
+static void sigchld_handler(int s)
+{
+    (void)s;
+
+    // waitpid() might overwrite errno, so we save and restore it:
+    int saved_errno = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+    errno = saved_errno;
+}
+
+/*
+ * Log Handling
+ */
+
 static void init_log(int enable_debug, const char *log_path, int enable_syslog, LogLevel level)
 {
     debug_mode = enable_debug;
@@ -202,6 +216,10 @@ static void close_log()
         closelog();
 }
 
+/*
+ * Connection functions
+ */
+
 static void *get_in_addr(struct sockaddr *sa)
 {
     if (sa->sa_family == AF_INET)
@@ -214,7 +232,6 @@ static struct connection *new_connection()
 {
     struct connection *conn = malloc(sizeof(struct connection));
 
-    conn->fd = -1;
     conn->req = NULL;
     conn->req_len = 0;
     conn->method = NULL;
@@ -249,25 +266,25 @@ static void set_nonblocking(int fd)
  * pulled from conn->req so we just have to ensure that all that
  * data exists and is freed along with conn->req
  */
-static void close_connection(struct connection *conn, int epoll_fd)
+static void close_connection(struct connection *conn, int client_fd, size_t i)
 {
-    if (conn->fd != -1) close(conn->fd);
+    if (client_fd != -1) close(client_fd);
     if (conn->req != NULL) free(conn->req);
     if (conn->header != NULL) free(conn->header);
     if (conn->resp_fd != -1) close(conn->resp_fd);
     if (conn->resp != NULL) free(conn->resp);
 
-    // REPLACE WITH POLL REMOVAL
-    /* epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL); */
+    pfds[i] = pfds[conn_count - 1];
+    conn_count--;
 }
 
-static void keepalive_connection(struct connection *conn, int epoll_fd)
+static void keepalive_connection(struct connection *conn, int client_fd, size_t i)
 {
     assert(conn->state == CONN_CLOSING);
-    int tmpfd = conn->fd;
-    conn->fd = -1;
-    close_connection(conn, epoll_fd);
-    conn->fd = tmpfd;
+    int tmpfd = client_fd;
+    client_fd = -1;
+    close_connection(conn, client_fd, i);
+    client_fd = tmpfd;
 
     conn->req = NULL;
     conn->req_len = 0;
@@ -289,6 +306,64 @@ static void keepalive_connection(struct connection *conn, int epoll_fd)
 
     conn->state = CONN_READING;
 }
+
+/*
+ * Returns the file descriptor to the server listener
+ * thank u beej
+ */
+static int init_socket()
+{
+    int fd;
+    struct addrinfo hints, *ai, *p;
+    int yes = 1;
+    int rv;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    if ((rv = getaddrinfo(NULL, port, &hints, &ai)) != 0) {
+        fprintf(stderr, "init_socket (getaddrinfo): %s\n", gai_strerror(rv));
+        exit(EXIT_FAILURE);
+    }
+
+    for (p = ai; p != NULL; p = p->ai_next) {
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        if (bind(fd, p->ai_addr, p->ai_addrlen) == -1) {
+            close(fd);
+            perror("init_socket (bind)");
+            continue;
+        }
+
+        break;
+    }
+
+    if (p == NULL) {
+        fprintf(stderr, "init_socket (failed to bind)\n");
+        exit(EXIT_FAILURE);
+    }
+
+    freeaddrinfo(ai);
+
+    if (listen(fd, MAX_EVENTS) == -1) {
+        perror("init_socket (listen)");
+        exit(EXIT_FAILURE);
+    }
+
+    return fd;
+}
+
+
+/*
+ * Network Utils
+ */
 
 #define DATE_LEN 30
 static char *rfc1123_date(char *dest, const time_t when)
@@ -404,6 +479,10 @@ static char *sanitize_url(char *const url)
 
     return url;
 }
+
+/*
+ * Server Functions
+ */
 
 static void server_response(struct connection *conn, const int code,
                      const char *ename, const char *format, ...)
@@ -683,17 +762,21 @@ static int parse_request(struct connection *conn)
     return i;
 }
 
-static void recv_req(struct connection *conn, int epoll_fd)
+/*
+ * Response/Request Handlers
+ */
+
+static void recv_req(struct connection *conn, int client_fd)
 {
     assert(conn->state == CONN_READING);
     char buf[1024];
     ssize_t recvd;
 
-    recvd = recv(conn->fd, buf, sizeof(buf), 0);
+    recvd = recv(client_fd, buf, sizeof(buf), 0);
     if (recvd < 1) {
         if (recvd == -1)
-            fprintf(stderr, "recv_req (recv) %d: %s\n",
-                    conn->fd, strerror(errno));
+            log_msg(LERROR, "recv_req (recv) %d: %s\n",
+                    client_fd, strerror(errno));
 
         conn->state = CONN_CLOSING;
         return;
@@ -721,26 +804,20 @@ static void recv_req(struct connection *conn, int epoll_fd)
     }
 
     conn->state = CONN_WRITING;
-
-    // replace with poll handling! IDK if there even is something for this
-    /* struct epoll_event ev = {0}; */
-    /* ev.events = EPOLLOUT; */
-    /* ev.data.ptr = conn; */
-    /* epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev); */
 }
 
-static void send_resp(struct connection *conn)
+static void send_resp(struct connection *conn, int client_fd)
 {
     assert(conn->state == CONN_WRITING);
     ssize_t header_sent, resp_sent = 0;
     off_t offset = 0;
 
     assert(conn->header_len == strlen(conn->header));
-    header_sent = send(conn->fd, conn->header, conn->header_len, 0);
+    header_sent = send(client_fd, conn->header, conn->header_len, 0);
     if (header_sent < 1) {
         if (header_sent == -1)
             fprintf(stderr, "send_resp (send headers) %d: %s\n",
-                    conn->fd, strerror(errno));
+                    client_fd, strerror(errno));
 
         conn->state = CONN_CLOSING;
         return;
@@ -753,16 +830,16 @@ static void send_resp(struct connection *conn)
     switch (conn->resp_type) {
         case SERV_RESP:
             assert(conn->resp_len == strlen(conn->resp));
-            resp_sent = send(conn->fd, conn->resp, conn->resp_len, 0);
+            resp_sent = send(client_fd, conn->resp, conn->resp_len, 0);
             break;
         case FILE_RESP:
-            resp_sent = sendfile(conn->fd, conn->resp_fd, &offset, conn->resp_len);
+            resp_sent = sendfile(client_fd, conn->resp_fd, &offset, conn->resp_len);
             break;
     }
     if (resp_sent < 1) {
         if (resp_sent == -1)
             fprintf(stderr, "send_resp (send resp) %d: %s\n",
-                    conn->fd, strerror(errno));
+                    client_fd, strerror(errno));
 
         conn->state = CONN_CLOSING;
         return;
@@ -772,57 +849,8 @@ static void send_resp(struct connection *conn)
 }
 
 /*
- * Returns the file descriptor to the server listener
- * thank u beej
+ * System Processes
  */
-static int init_socket()
-{
-    int fd;
-    struct addrinfo hints, *ai, *p;
-    int yes = 1;
-    int rv;
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
-
-    if ((rv = getaddrinfo(NULL, port, &hints, &ai)) != 0) {
-        fprintf(stderr, "init_socket (getaddrinfo): %s\n", gai_strerror(rv));
-        exit(EXIT_FAILURE);
-    }
-
-    for (p = ai; p != NULL; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) {
-            continue;
-        }
-
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-        if (bind(fd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(fd);
-            perror("init_socket (bind)");
-            continue;
-        }
-
-        break;
-    }
-
-    if (p == NULL) {
-        fprintf(stderr, "init_socket (failed to bind)\n");
-        exit(EXIT_FAILURE);
-    }
-
-    freeaddrinfo(ai);
-
-    if (listen(fd, MAX_EVENTS) == -1) {
-        perror("init_socket (listen)");
-        exit(EXIT_FAILURE);
-    }
-
-    return fd;
-}
 
 static int fd_null = -1;
 
@@ -919,31 +947,101 @@ static void parse_args(const int argc, char *argv[])
     }
 }
 
+/*
+ * Event Loop
+ */
+
+static void accept_conn(struct connection *conn)
+{
+    int client_fd;
+    struct sockaddr_storage client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    char clientIP[INET6_ADDRSTRLEN];
+
+    client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+    if (client_fd == -1) {
+        log_msg(LERROR, "accept_conn() accept: %s",
+                strerror(errno));
+    }
+
+    set_nonblocking(client_fd);
+    pfds[conn_count].fd = client_fd;
+    pfds[conn_count].events = POLLIN;
+    conns[conn_count] = conn;
+    conns[conn_count]->state = CONN_READING;
+    conn_count++;
+
+    log_msg(LINFO, "new connection from %s on socket %d",
+            inet_ntop(client_addr.ss_family,
+                      get_in_addr((struct sockaddr *)&client_addr),
+                      clientIP, INET6_ADDRSTRLEN),
+            client_fd);
+}
+
 static void server_process()
 {
-    struct pollfd pfds[MAX_EVENTS];
     int ret;
-    size_t fd_count = 0;
 
     pfds[0].fd = server_fd;
     pfds[0].events = POLLIN;
-    fd_count++;
+    conn_count = 1;
 
     for (;;) {
-        ret = poll(pfds, fd_count, TIMEOUT_SECS * 1000);
+        ret = poll(pfds, conn_count, TIMEOUT_SECS * 1000);
         if (ret == -1) {
             perror("poll");
             exit(EXIT_FAILURE);
         }
 
-        for (size_t i = 0; i < fd_count; i++) {
-            if (pfds[i].fd == server_fd) {
-                // accept_conn()
-                // takes in the server_fd, pfds array?
+        for (size_t i = 0; i < conn_count; i++) {
+            if (pfds[i].revents & POLLIN) {
+                if (pfds[i].fd == server_fd) {
+                    struct connection *new_conn = new_connection();
+                    accept_conn(new_conn);
+                } else {
+                    struct connection *conn = conns[i];
+                    int client_fd = pfds[i].fd;
+
+                    now = time(NULL);
+
+                    if (conn->state == CONN_READING) {
+                        recv_req(conn, client_fd);
+                        if (conn->state == CONN_WRITING)
+                            pfds[i].events = POLLOUT;
+                    }
+
+                    if (conn->state == CONN_CLOSING) {
+                        if (conn->keepalive)
+                            keepalive_connection(conn, client_fd, i);
+                        else
+                            close_connection(conn, client_fd, i);
+                    }
+                }
+            } else if (pfds[i].revents & POLLOUT) {
+                struct connection *conn = conns[i];
+                int client_fd = pfds[i].fd;
+
+                if (conn->state == CONN_WRITING) {
+                    send_resp(conn, client_fd);
+                    continue;
+                }
+
+                if (conn->state == CONN_CLOSING) {
+                    if (conn->keepalive)
+                        keepalive_connection(conn, client_fd, i);
+                    else
+                        close_connection(conn, client_fd, i);
+                }
             }
         }
     }
+
+    close(server_fd);
 }
+
+/*
+ * Main
+ */
 
 int main(int argc, char *argv[])
 {
@@ -982,65 +1080,7 @@ int main(int argc, char *argv[])
     if (running)
         server_process();
 
-    // REPLACE WITH POLL STUFF HERE
-    /* int epoll_fd = epoll_create1(0); */
-    /* struct epoll_event ev = {0}; */
-    /* ev.events = EPOLLIN; */
-    /* ev.data.fd = server_fd; */
-    /* epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev); */
+    close_log();
 
-    /* struct epoll_event events[MAX_EVENTS]; */
-
-    /* for (;;) { */
-    /*     int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1); */
-    /*     for (int i = 0; i < n; i++) { */
-    /*         if (events[i].data.fd == server_fd) { */
-    /*             struct sockaddr_storage client_addr; */
-    /*             socklen_t addrlen; */
-    /*             char clientIP[INET6_ADDRSTRLEN]; */
-    /*             // accept new conn */
-    /*             int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen); */
-    /*             struct connection *conn = new_connection(); */
-    /*             conn->fd = client_fd; */
-    /*             set_nonblocking(conn->fd); */
-    /*             conn->state = CONN_READING; */
-
-    /*             log_msg(LINFO, "new connection %s on socket %d", */
-    /*                     inet_ntop(client_addr.ss_family, */
-    /*                               get_in_addr((struct sockaddr *)&client_addr), */
-    /*                               clientIP, INET6_ADDRSTRLEN), */
-    /*                     conn->fd); */
-
-    /*             struct epoll_event client_ev = {0}; */
-    /*             client_ev.events = EPOLLIN; */
-    /*             client_ev.data.ptr = conn; */
-    /*             epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev); */
-    /*         } else { */
-    /*             now = time(NULL); */
-    /*             struct connection *conn = events[i].data.ptr; */
-    /*             if (conn->state == CONN_READING && (events[i].events & EPOLLIN)) { */
-    /*                 recv_req(conn, epoll_fd); */
-    /*             } else if (conn->state == CONN_WRITING && (events[i].events & EPOLLOUT)) { */
-    /*                 send_resp(conn); */
-    /*             } */
-
-    /*             if (conn->state == CONN_CLOSING) { */
-    /*                 if (conn->keepalive) { */
-    /*                     keepalive_connection(conn, epoll_fd); */
-
-    /*                     struct epoll_event ev = {0}; */
-    /*                     ev.events = EPOLLIN; */
-    /*                     ev.data.ptr = conn; */
-    /*                     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev); */
-    /*                 } else { */
-    /*                     close_connection(conn, epoll_fd); */
-    /*                 } */
-    /*             } */
-    /*         } */
-    /*     } */
-    /* } */
-
-    close(server_fd);
-    /* close(epoll_fd); */
     return 0;
 }
