@@ -31,7 +31,7 @@
  * Defines and structs
  */
 
-static const char PKG_NAME[] = "lilyhttpd v0.2.0";
+static const char PKG_NAME[] = "lilyhttpd v0.3.0";
 
 #define MAX_EVENTS 1024
 #define TIMEOUT_SECS 10
@@ -1020,6 +1020,8 @@ static void server_process()
             } else if (pfds[i].revents & POLLOUT) {
                 struct connection *conn = conns[i];
                 int client_fd = pfds[i].fd;
+
+                now = time(NULL);
 
                 if (conn->state == CONN_WRITING) {
                     send_resp(conn, client_fd);
