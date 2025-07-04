@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <assert.h>
+#include <brotli/encode.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,6 +28,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <zconf.h>
+#include <zlib.h>
 
 /*
  * Defines and structs
@@ -69,13 +72,7 @@ struct connection {
     char *authorization;
     char *if_modified_since;
     int keepalive;
-    int compress;
-    enum {
-        GZIP,
-        DEFLATE,
-        BR,
-        ZSTD
-    } compression;
+    char *compression_algorithm;
 
     char *header;
     size_t header_len;
@@ -83,6 +80,7 @@ struct connection {
 
     enum {
         SERV_RESP,
+        CMPR_RESP,
         FILE_RESP
     } resp_type;
     int resp_fd;
@@ -252,7 +250,7 @@ static struct connection *new_connection()
     conn->authorization = NULL;
     conn->if_modified_since = NULL;
     conn->keepalive = 0;
-    conn->compress = 0;
+    conn->compression_algorithm = NULL;
     conn->header = NULL;
     conn->header_len = 0;
     conn->header_only = 0;
@@ -307,7 +305,6 @@ static void keepalive_connection(struct connection *conn, int client_fd, size_t 
     conn->authorization = NULL;
     conn->if_modified_since = NULL;
     conn->keepalive = 0;
-    conn->compress = 0;
     conn->header = NULL;
     conn->header_len = 0;
     conn->header_only = 0;
@@ -500,6 +497,90 @@ static char *sanitize_url(char *const url)
 }
 
 /*
+ * Compression
+ */
+
+int compress_gzip(int fd, size_t len, unsigned char **out_buf, size_t *out_len)
+{
+    unsigned char *in_buf = malloc(len);
+    if (!in_buf)
+        return -1;
+
+    if (read(fd, in_buf, len) != (ssize_t)len) {
+        free(in_buf);
+        return -1;
+    }
+
+    // allocate buf slightly larger than original (for zlib)
+    uLongf comp_len = compressBound(len);
+    *out_buf = malloc(comp_len);
+    if (!*out_buf) {
+        free(in_buf);
+        return -1;
+    }
+
+    // 16 + MAX_WBITS enables gzip header/trailer
+    z_stream strm = {0};
+    deflateInit2(&strm, Z_BEST_COMPRESSION, Z_DEFLATED, 16 + MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
+
+    strm.avail_in = len;
+    strm.next_in = in_buf;
+    strm.avail_out = comp_len;
+    strm.next_out = *out_buf;
+
+    int ret = deflate(&strm, Z_FINISH);
+    if (ret != Z_STREAM_END) {
+        deflateEnd(&strm);
+        free(in_buf);
+        free(*out_buf);
+        return -1;
+    }
+
+    *out_len = strm.total_out;
+    deflateEnd(&strm);
+    free(in_buf);
+    return 0;
+}
+
+int compress_brotli(int fd, size_t len, unsigned char **out_buf, size_t *out_len)
+{
+    unsigned char *in_buf = malloc(len);
+    if (!in_buf)
+        return -1;
+
+    if (read(fd, in_buf, len) != (ssize_t)len) {
+        free(in_buf);
+        return -1;
+    }
+
+    // start with a large enough buf
+    size_t comp_len = BrotliEncoderMaxCompressedSize(len);
+    *out_buf = malloc(comp_len);
+    if (!*out_buf) {
+        free(in_buf);
+        return -1;
+    }
+
+    if (!BrotliEncoderCompress(
+        BROTLI_DEFAULT_QUALITY,
+        BROTLI_DEFAULT_WINDOW,
+        BROTLI_MODE_GENERIC,
+        len,
+        in_buf,
+        &comp_len,
+        *out_buf))
+    {
+        free(in_buf);
+        free(*out_buf);
+        return -1;
+    }
+
+    *out_len = comp_len;
+    free(in_buf);
+    return 0;
+}
+
+/*
  * Server Functions
  */
 
@@ -559,16 +640,12 @@ static void process_get(struct connection *conn)
 {
     char *target, *end, *decoded, *type_start, *type;
     char date[DATE_LEN], last_modified[DATE_LEN];
-    // char absolute_path[PATH_MAX];
     struct stat filestat;
 
     if ((end = strchr(conn->url, '?')) != NULL)
         *end = '\0';
 
-    // decode URL
-    // free this!
     decoded = decode_url(conn->url);
-    // ensure path safety
     if (!(sanitize_url(decoded))) {
         server_response(conn, 400, "Bad Request", "The URL you requested is invalid");
         goto clean;
@@ -650,8 +727,52 @@ static void process_get(struct connection *conn)
     conn->resp_type = FILE_RESP;
     conn->resp_len = filestat.st_size;
 
-    if (conn->resp_len > 2048 && should_compress(type))
-        conn->compress = 1;
+    if (conn->resp_len > 2048 && should_compress(type)) {
+        conn->resp_type = CMPR_RESP;
+        size_t new_resp_len = 0;
+
+        if (conn->compression_algorithm == NULL) {
+            log_msg(LERROR, "process_get() no compression algorithm string");
+            server_response(conn, 500, "Interal Server Error", "There was a problem");
+            return;
+        }
+        if (strcasecmp(conn->compression_algorithm, "gzip") == 0) {
+            if (compress_gzip(conn->resp_fd, conn->resp_len, (unsigned char **)&conn->resp, &new_resp_len) != 0) {
+                log_msg(LERROR, "process_get() gzip compression error: %s", strerror(errno));
+                server_response(conn, 500, "Internal Server Error", "There was a problem serving your file");
+                return;
+            }
+        }
+        else if (strcasecmp(conn->compression_algorithm, "br") == 0) {
+            if (compress_brotli(conn->resp_fd, conn->resp_len, (unsigned char **)&conn->resp, &new_resp_len) != 0) {
+                log_msg(LERROR, "process_get() brotli compression error: %s", strerror(errno));
+                server_response(conn, 500, "Internal Server Error", "There was a problem serving your file");
+                return;
+            }
+        }
+
+        conn->resp_len = new_resp_len;
+        conn->header_len = asprintf(&(conn->header),
+                "HTTP/1.1 200 OK\r\n"
+                "Date: %s\r\n"
+                "%s\r\n" // server
+                "Connection: %s\r\n" // keepalive
+                "Content-Length: %zu\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Encoding: %s\r\n"
+                "Last-Modified: %s\r\n"
+                "\r\n",
+                rfc1123_date(date, now),
+                server_header,
+                conn->keepalive ? "keep-alive" : "close",
+                new_resp_len,
+                type,
+                conn->compression_algorithm,
+                last_modified
+        );
+
+        return;
+    }
 
     conn->header_len = asprintf(&(conn->header),
             "HTTP/1.1 200 OK\r\n"
@@ -660,7 +781,6 @@ static void process_get(struct connection *conn)
             "Connection: %s\r\n" // keepalive
             "Content-Length: %zu\r\n"
             "Content-Type: %s\r\n"
-            "%s" // content-encoding
             "Last-Modified: %s\r\n"
             "\r\n",
             rfc1123_date(date, now),
@@ -668,7 +788,6 @@ static void process_get(struct connection *conn)
             conn->keepalive ? "keep-alive" : "close",
             conn->resp_len,
             type,
-            conn->compress ? "Content-Encoding: gzip\r\n" : "",
             last_modified
     );
 
@@ -686,13 +805,11 @@ static void parse_compression_algorithm(struct connection *conn, char *field)
 {
     size_t i = 0;
     size_t len = strlen(field);
-    double highest_qval = -1.0f;
-    char *current_compression;
+    char *current_compression = NULL;
 
-    do {
+    while (i < len) {
         char *algo = NULL;
         size_t algo_start = i;
-        double qval = 0.0f;
 
         for (; i < len &&
             field[i] != ',' &&
@@ -703,35 +820,23 @@ static void parse_compression_algorithm(struct connection *conn, char *field)
             field[i] = '\0';
             algo = &field[algo_start];
             i += 3;
-            size_t qval_pos = i;
             for (; i < len && field[i] != ','; i++);
-            field[i] = '\0';
-            qval = strtod(&field[qval_pos], NULL);
             i += 2;
+            current_compression = algo;
         } else if (field[i] == ',' || field[i] == '\0') {
             field[i] = '\0';
             algo = &field[algo_start];
             i += 2;
-            qval = 0.0f;
+            current_compression = algo;
         }
 
-        if (highest_qval > qval)
-            continue;
-        else
-            highest_qval = qval;
+        if (strcasecmp(algo, "gzip") == 0 || strcasecmp(algo, "br") == 0)
+            break;
+    }
 
-        current_compression = algo;
-    } while (i < len);
+    conn->compression_algorithm = current_compression;
 
-    if (strcasecmp(current_compression, "gzip") == 0 ||
-            strcasecmp(current_compression, "*") == 0)
-        conn->compression = GZIP;
-    else if (strcasecmp(current_compression, "deflate") == 0)
-        conn->compression = DEFLATE;
-    else if (strcasecmp(current_compression, "br") == 0)
-        conn->compression = BR;
-    else if (strcasecmp(current_compression, "zstd") == 0)
-        conn->compression = ZSTD;
+    printf("%s\n", conn->compression_algorithm);
 }
 
 /*
@@ -902,6 +1007,9 @@ static void send_resp(struct connection *conn, int client_fd)
     switch (conn->resp_type) {
         case SERV_RESP:
             assert(conn->resp_len == strlen(conn->resp));
+            resp_sent = send(client_fd, conn->resp, conn->resp_len, 0);
+            break;
+        case CMPR_RESP:
             resp_sent = send(client_fd, conn->resp, conn->resp_len, 0);
             break;
         case FILE_RESP:
