@@ -281,6 +281,7 @@ static void close_connection(struct connection *conn, int client_fd, size_t i)
     if (conn->header != NULL) free(conn->header);
     if (conn->resp_fd != -1) close(conn->resp_fd);
     if (conn->resp != NULL) free(conn->resp);
+    free(conn);
 
     pfds[i] = pfds[conn_count - 1];
     conn_count--;
